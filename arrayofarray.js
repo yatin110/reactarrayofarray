@@ -143,3 +143,6 @@ const FormComponent = () => {
 };
 
 export default FormComponent;
+
+
+npm install @rjsf/validator-ajv8
