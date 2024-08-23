@@ -146,3 +146,67 @@ export default FormComponent;
 
 
 npm install @rjsf/validator-ajv8
+
+
+
+
+
+// src/components/FormComponent.js
+import React from "react";
+import Form from "@rjsf/core";
+import validator from "@rjsf/validator-ajv8";
+
+const schema = {
+  title: "User Form",
+  type: "object",
+  required: ["name", "age", "friends"],
+  properties: {
+    name: {
+      type: "string",
+      title: "Name",
+    },
+    age: {
+      type: "number",
+      title: "Age",
+    },
+    friends: {
+      type: "array",
+      title: "Friends",
+      items: {
+        type: "string",
+        title: "Friend's Name",
+      },
+      minItems: 1, // You can specify minItems to ensure at least one friend is added
+    },
+  },
+};
+
+const uiSchema = {
+  friends: {
+    "ui:options": {
+      addable: true, // Allow adding more items
+      orderable: true, // Allow reordering items
+      removable: true, // Allow removing items
+    },
+  },
+};
+
+const FormComponent = () => {
+  const handleSubmit = ({ formData }) => {
+    console.log("Form Data:", formData);
+  };
+
+  return (
+    <div>
+      <h2>Dynamic Form from JSON Schema</h2>
+      <Form
+        schema={schema}
+        uiSchema={uiSchema}
+        validator={validator}
+        onSubmit={handleSubmit}
+      />
+    </div>
+  );
+};
+
+export default FormComponent;
