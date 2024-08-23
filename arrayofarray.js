@@ -96,3 +96,50 @@ function App() {
 }
 
 export default App;
+
+
+
+
+
+// src/components/FormComponent.js
+import React from "react";
+import Form from "@rjsf/core";
+
+const schema = {
+  title: "User Form",
+  type: "object",
+  required: ["name", "age", "friends"],
+  properties: {
+    name: {
+      type: "string",
+      title: "Name",
+    },
+    age: {
+      type: "number",
+      title: "Age",
+    },
+    friends: {
+      type: "array",
+      title: "Friends",
+      items: {
+        type: "string",
+      },
+    },
+  },
+};
+
+const FormComponent = () => {
+  const handleSubmit = ({ formData }) => {
+    console.log("Form Data:", formData);
+    // You can save the formData as JSON or send it to a backend
+  };
+
+  return (
+    <div>
+      <h2>Dynamic Form from JSON Schema</h2>
+      <Form schema={schema} onSubmit={handleSubmit} />
+    </div>
+  );
+};
+
+export default FormComponent;
