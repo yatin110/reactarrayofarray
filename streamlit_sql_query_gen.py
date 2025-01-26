@@ -6,23 +6,27 @@ import pandas as pd
 def create_db_engine(username, password, host, port, service_name):
     try:
         dsn = f"oracle+cx_oracle://{username}:{password}@{host}:{port}/?service_name={service_name}"
-        engine = create_engine(dsn)
+        engine = create_engine(dsn, pool_pre_ping=True)
         return engine
     except Exception as e:
         st.error(f"Error connecting to database: {str(e)}")
         return None
 
-# Function to fetch table and column metadata
+# Function to fetch table and column metadata with caching
 def fetch_metadata(engine):
     try:
-        with engine.connect() as conn:
-            tables_query = "SELECT table_name FROM user_tables"
-            tables = pd.read_sql(tables_query, conn)
+        @st.cache_data(show_spinner=False)
+        def fetch_data():
+            with engine.connect() as conn:
+                tables_query = "SELECT table_name FROM user_tables"
+                tables = pd.read_sql(tables_query, conn)
 
-            columns_query = "SELECT table_name, column_name FROM user_tab_columns"
-            columns = pd.read_sql(columns_query, conn)
+                columns_query = "SELECT table_name, column_name FROM user_tab_columns"
+                columns = pd.read_sql(columns_query, conn)
 
-            return tables, columns
+                return tables, columns
+
+        return fetch_data()
     except Exception as e:
         st.error(f"Error fetching metadata: {str(e)}")
         return None, None
@@ -55,7 +59,7 @@ def main():
         if tables is not None and columns is not None:
             st.header("Build Your Query")
 
-            selected_tables = st.multiselect("Select Tables", tables["table_name"].tolist())
+            selected_tables = st.multiselect("Select Tables", tables["table_name"].tolist(), help="Choose the tables you want to use in your query.")
 
             query_columns = []
             joins = []
@@ -64,7 +68,12 @@ def main():
             if selected_tables:
                 for table in selected_tables:
                     table_columns = columns[columns["table_name"] == table]["column_name"].tolist()
-                    selected_columns = st.multiselect(f"Select Columns for {table}", table_columns)
+                    selected_columns = st.multiselect(
+                        f"Select Columns for {table}",
+                        table_columns,
+                        help=f"Choose columns from the table {table} to include in your query.",
+                        key=f"cols_{table}"
+                    )
                     query_columns.extend([f"{table}.{col}" for col in selected_columns])
 
                 if len(selected_tables) > 1:
@@ -78,8 +87,18 @@ def main():
                             right_columns = columns[columns["table_name"] == right_table]["column_name"].tolist()
 
                             st.markdown(f"### Join between {left_table} and {right_table}")
-                            left_column = st.selectbox(f"Select column from {left_table}", left_columns, key=f"left_{i}_{j}")
-                            right_column = st.selectbox(f"Select column from {right_table}", right_columns, key=f"right_{i}_{j}")
+                            left_column = st.selectbox(
+                                f"Select column from {left_table}",
+                                left_columns,
+                                key=f"left_{i}_{j}",
+                                help=f"Choose a column from {left_table} for the join condition."
+                            )
+                            right_column = st.selectbox(
+                                f"Select column from {right_table}",
+                                right_columns,
+                                key=f"right_{i}_{j}",
+                                help=f"Choose a column from {right_table} for the join condition."
+                            )
 
                             if left_column and right_column:
                                 join_condition = f"{left_table}.{left_column} = {right_table}.{right_column}"
@@ -88,7 +107,12 @@ def main():
                 st.subheader("Add WHERE Conditions")
                 if query_columns:
                     for col in query_columns:
-                        condition = st.text_input(f"Condition for {col} (e.g., = 'value', > 10)", key=f"condition_{col}")
+                        condition = st.text_input(
+                            f"Condition for {col}",
+                            placeholder="e.g., = 'value', > 10",
+                            key=f"condition_{col}",
+                            help=f"Specify a condition for {col}, such as a comparison or specific value."
+                        )
                         if condition:
                             where_conditions.append(f"{col} {condition}")
 
@@ -106,14 +130,19 @@ def main():
                     else:
                         query += f" WHERE {where_clause}"
 
-                st.text(query)
+                st.text_area(
+                    "Generated SQL Query",
+                    value=query,
+                    height=200,
+                    help="This is your generated SQL query. You can copy it for further use."
+                )
 
-                if st.button("Execute Query"):
+                if st.button("Execute Query", help="Run the query and display the results below."):
                     try:
                         with engine.connect() as conn:
                             result = pd.read_sql(text(query), conn)
                             st.subheader("Query Results")
-                            st.dataframe(result)
+                            st.dataframe(result, use_container_width=True)
                     except Exception as e:
                         st.error(f"Error executing query: {str(e)}")
 
