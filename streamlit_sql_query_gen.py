@@ -14,6 +14,11 @@ class OracleSQLQueryBuilder:
         Establish connection to Oracle database
         """
         try:
+            # Close existing connection if open
+            if self.connection:
+                self.connection.close()
+
+            # Establish new connection
             self.connection = cx_Oracle.connect(
                 user=username,
                 password=password,
@@ -29,6 +34,7 @@ class OracleSQLQueryBuilder:
             self.tables = [table[0] for table in cursor.fetchall()]
             
             # Fetch columns for each table
+            self.columns = {}
             for table in self.tables:
                 cursor.execute(f"""
                     SELECT column_name, data_type 
@@ -45,8 +51,13 @@ class OracleSQLQueryBuilder:
 
     def build_query_ui(self):
         """
-        Build the query construction UI with multi-column join support
+        Build the query construction UI
         """
+        # Ensure connection exists before proceeding
+        if not self.connection:
+            st.warning("Please connect to the database first.")
+            return
+
         st.header("Oracle SQL Query Builder")
         
         # Table selection
@@ -188,6 +199,10 @@ class OracleSQLQueryBuilder:
             st.error(f"Error executing query: {e}")
 
 def main():
+    # Initialize or retrieve query builder from session state
+    if 'query_builder' not in st.session_state:
+        st.session_state.query_builder = OracleSQLQueryBuilder()
+
     st.title("Oracle SQL Query Builder")
     
     # Connection Parameters
@@ -198,10 +213,12 @@ def main():
         dsn = st.text_input("DSN (Data Source Name)")
         
         if st.button("Connect"):
-            query_builder = OracleSQLQueryBuilder()
-            if query_builder.connect_to_database(username, password, dsn):
+            if st.session_state.query_builder.connect_to_database(username, password, dsn):
                 st.success("Connected Successfully!")
-                query_builder.build_query_ui()
+    
+    # Build query UI if connected
+    if hasattr(st.session_state.query_builder, 'connection') and st.session_state.query_builder.connection:
+        st.session_state.query_builder.build_query_ui()
 
 if __name__ == "__main__":
     main()
