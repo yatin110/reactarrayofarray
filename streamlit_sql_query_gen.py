@@ -59,6 +59,7 @@ def main():
 
             query_columns = []
             joins = []
+            where_conditions = []
 
             if selected_tables:
                 for table in selected_tables:
@@ -68,28 +69,42 @@ def main():
 
                 if len(selected_tables) > 1:
                     st.subheader("Define Joins")
-                    for i in range(len(selected_tables) - 1):
-                        left_table = selected_tables[i]
-                        right_table = selected_tables[i + 1]
+                    for i in range(len(selected_tables)):
+                        for j in range(i + 1, len(selected_tables)):
+                            left_table = selected_tables[i]
+                            right_table = selected_tables[j]
 
-                        left_columns = columns[columns["table_name"] == left_table]["column_name"].tolist()
-                        right_columns = columns[columns["table_name"] == right_table]["column_name"].tolist()
+                            left_columns = columns[columns["table_name"] == left_table]["column_name"].tolist()
+                            right_columns = columns[columns["table_name"] == right_table]["column_name"].tolist()
 
-                        st.markdown(f"### Join between {left_table} and {right_table}")
-                        left_column = st.selectbox(f"Select column from {left_table}", left_columns, key=f"left_{i}")
-                        right_column = st.selectbox(f"Select column from {right_table}", right_columns, key=f"right_{i}")
+                            st.markdown(f"### Join between {left_table} and {right_table}")
+                            left_column = st.selectbox(f"Select column from {left_table}", left_columns, key=f"left_{i}_{j}")
+                            right_column = st.selectbox(f"Select column from {right_table}", right_columns, key=f"right_{i}_{j}")
 
-                        join_condition = f"{left_table}.{left_column} = {right_table}.{right_column}"
-                        joins.append(join_condition)
+                            if left_column and right_column:
+                                join_condition = f"{left_table}.{left_column} = {right_table}.{right_column}"
+                                joins.append(join_condition)
+
+                st.subheader("Add WHERE Conditions")
+                if query_columns:
+                    for col in query_columns:
+                        condition = st.text_input(f"Condition for {col} (e.g., = 'value', > 10)", key=f"condition_{col}")
+                        if condition:
+                            where_conditions.append(f"{col} {condition}")
 
             if query_columns:
                 st.subheader("Query Preview")
-                join_clause = f" ON {joins[0]}" if joins else ""
-                query = f"SELECT {', '.join(query_columns)} FROM {selected_tables[0]}"
+                query = f"SELECT {', '.join(query_columns)} FROM {', '.join(selected_tables)}"
 
                 if joins:
-                    for i in range(1, len(selected_tables)):
-                        query += f" JOIN {selected_tables[i]} ON {joins[i - 1]}"
+                    query += f" WHERE {' AND '.join(joins)}"
+
+                if where_conditions:
+                    where_clause = ' AND '.join(where_conditions)
+                    if 'WHERE' in query:
+                        query += f" AND {where_clause}"
+                    else:
+                        query += f" WHERE {where_clause}"
 
                 st.text(query)
 
