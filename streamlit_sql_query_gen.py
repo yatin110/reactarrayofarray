@@ -1,153 +1,187 @@
-import streamlit as st
-import pandas as pd
+from flask import Flask, jsonify
 import cx_Oracle
-from typing import Tuple
-import re
+from configparser import ConfigParser
+import logging
+import os
+from flasgger import Swagger, swag_from
 
-def create_connection():
-    """Create and return Oracle database connection"""
-    # Replace these with your actual database credentials
-    connection = cx_Oracle.connect(
-        user="your_username",
-        password="your_password",
-        dsn="your_host:1521/your_service_name"
-    )
-    return connection
+# Initialize Flask app
+app = Flask(__name__)
 
-def validate_sql(sql: str) -> bool:
-    """Basic SQL validation to prevent harmful queries"""
-    sql_lower = sql.lower()
+# Configure Swagger
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec',
+            "route": '/apispec.json',
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/docs"
+}
+
+swagger = Swagger(app, config=swagger_config, template={
+    "swagger": "2.0",
+    "info": {
+        "title": "Template Query API",
+        "description": "API for retrieving SQL queries and variables from templates",
+        "version": "1.0.0",
+        "contact": {
+            "email": "your-email@example.com"
+        }
+    }
+})
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load database configuration from config file
+def load_db_config(filename='config.ini', section='oracle'):
+    parser = ConfigParser()
+    parser.read(filename)
     
-    # Check for DML/DDL operations
-    forbidden_keywords = ['insert', 'update', 'delete', 'drop', 'create', 'alter', 'truncate']
-    if any(keyword in sql_lower for keyword in forbidden_keywords):
-        return False
+    db_config = {}
+    if parser.has_section(section):
+        params = parser.items(section)
+        for param in params:
+            db_config[param[0]] = param[1]
+    else:
+        raise Exception(f'Section {section} not found in {filename}')
     
-    # Ensure it starts with SELECT
-    if not re.match(r'^\s*select', sql_lower):
-        return False
+    return db_config
+
+# Database connection function
+def get_db_connection():
+    try:
+        config = load_db_config()
+        connection = cx_Oracle.connect(
+            user=config['user'],
+            password=config['password'],
+            dsn=config['dsn']
+        )
+        return connection
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}")
+        raise
+
+@app.route('/api/template/<int:template_id>', methods=['GET'])
+@swag_from({
+    'tags': ['Templates'],
+    'summary': 'Get template by ID',
+    'parameters': [
+        {
+            'name': 'template_id',
+            'in': 'path',
+            'type': 'integer',
+            'required': True,
+            'description': 'ID of the template to retrieve'
+        }
+    ],
+    'responses': {
+        200: {
+            'description': 'Template found',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'status': {'type': 'string', 'example': 'success'},
+                    'data': {
+                        'type': 'object',
+                        'properties': {
+                            'template_id': {'type': 'integer', 'example': 1},
+                            'sql_query': {'type': 'string', 'example': 'SELECT * FROM table'},
+                            'variables': {'type': 'string', 'example': '["var1", "var2"]'}
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            'description': 'Template not found',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'status': {'type': 'string', 'example': 'error'},
+                    'message': {'type': 'string', 'example': 'Template ID not found'}
+                }
+            }
+        },
+        500: {
+            'description': 'Internal server error',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'status': {'type': 'string', 'example': 'error'},
+                    'message': {'type': 'string', 'example': 'Internal server error'}
+                }
+            }
+        }
+    }
+})
+def get_template(template_id):
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
         
-    return True
-
-def get_total_rows(connection, sql: str) -> int:
-    """Get total number of rows for the query"""
-    count_sql = f"SELECT COUNT(*) FROM ({sql})"
-    with connection.cursor() as cursor:
-        cursor.execute(count_sql)
-        return cursor.fetchone()[0]
-
-def fetch_page_data(connection, sql: str, offset: int, limit: int) -> pd.DataFrame:
-    """Fetch a specific page of data"""
-    paginated_sql = f"""
-        SELECT * FROM (
-            SELECT a.*, ROWNUM rnum FROM ({sql}) a WHERE ROWNUM <= {offset + limit}
-        ) WHERE rnum > {offset}
-    """
-    
-    return pd.read_sql(paginated_sql, connection)
-
-def main():
-    st.title("SQL Query Explorer")
-    
-    # Initialize session state variables if they don't exist
-    if 'current_page' not in st.session_state:
-        st.session_state.current_page = 1
-    if 'total_pages' not in st.session_state:
-        st.session_state.total_pages = 0
-    if 'current_df' not in st.session_state:
-        st.session_state.current_df = None
-    if 'filters' not in st.session_state:
-        st.session_state.filters = {}
-    
-    # SQL Input
-    sql_query = st.text_area("Enter your SQL query:", height=150)
-    rows_per_page = 50
-    
-    if st.button("Execute Query"):
-        if not sql_query:
-            st.error("Please enter a SQL query.")
-            return
+        # Query to fetch template details
+        query = """
+            SELECT template_id, sql_query, variables
+            FROM template_table
+            WHERE template_id = :template_id
+        """
+        
+        cursor.execute(query, {'template_id': template_id})
+        result = cursor.fetchone()
+        
+        if result:
+            template_data = {
+                'template_id': result[0],
+                'sql_query': result[1],
+                'variables': result[2]  # Assuming variables are stored as a string
+            }
+            return jsonify({
+                'status': 'success',
+                'data': template_data
+            }), 200
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'Template ID {template_id} not found'
+            }), 404
             
-        if not validate_sql(sql_query):
-            st.error("Invalid or unauthorized SQL query. Only SELECT statements are allowed.")
-            return
-            
-        try:
-            connection = create_connection()
-            
-            # Get total rows and calculate total pages
-            total_rows = get_total_rows(connection, sql_query)
-            st.session_state.total_pages = (total_rows + rows_per_page - 1) // rows_per_page
-            
-            # Reset to first page
-            st.session_state.current_page = 1
-            
-            # Fetch first page
-            offset = (st.session_state.current_page - 1) * rows_per_page
-            st.session_state.current_df = fetch_page_data(connection, sql_query, offset, rows_per_page)
-            
+    except Exception as e:
+        logger.error(f"Error fetching template: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': 'Internal server error'
+        }), 500
+        
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
             connection.close()
-            
-        except Exception as e:
-            st.error(f"Error executing query: {str(e)}")
-            return
-    
-    # Display data and controls if we have a dataframe
-    if st.session_state.current_df is not None:
-        # Add filters for each column
-        st.subheader("Filters")
-        cols = st.columns(3)
-        current_col = 0
-        
-        for column in st.session_state.current_df.columns:
-            with cols[current_col]:
-                if column in st.session_state.filters:
-                    filter_value = st.text_input(f"Filter {column}", st.session_state.filters[column])
-                else:
-                    filter_value = st.text_input(f"Filter {column}")
-                
-                if filter_value:
-                    st.session_state.filters[column] = filter_value
-                elif column in st.session_state.filters:
-                    del st.session_state.filters[column]
-            
-            current_col = (current_col + 1) % 3
-        
-        # Apply filters
-        filtered_df = st.session_state.current_df.copy()
-        for column, filter_value in st.session_state.filters.items():
-            filtered_df = filtered_df[filtered_df[column].astype(str).str.contains(filter_value, case=False, na=False)]
-        
-        # Display the filtered dataframe
-        st.dataframe(filtered_df)
-        
-        # Pagination controls
-        col1, col2, col3 = st.columns([1, 2, 1])
-        
-        with col1:
-            if st.button("Previous", disabled=st.session_state.current_page <= 1):
-                st.session_state.current_page -= 1
-                
-                # Fetch previous page
-                connection = create_connection()
-                offset = (st.session_state.current_page - 1) * rows_per_page
-                st.session_state.current_df = fetch_page_data(connection, sql_query, offset, rows_per_page)
-                connection.close()
-                st.rerun()
-        
-        with col2:
-            st.write(f"Page {st.session_state.current_page} of {st.session_state.total_pages}")
-        
-        with col3:
-            if st.button("Next", disabled=st.session_state.current_page >= st.session_state.total_pages):
-                st.session_state.current_page += 1
-                
-                # Fetch next page
-                connection = create_connection()
-                offset = (st.session_state.current_page - 1) * rows_per_page
-                st.session_state.current_df = fetch_page_data(connection, sql_query, offset, rows_per_page)
-                connection.close()
-                st.rerun()
 
-if __name__ == "__main__":
-    main()
+# Error handlers
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Resource not found'
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Internal server error'
+    }), 500
+
+if __name__ == '__main__':
+    # Get port from environment variable or use default
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
