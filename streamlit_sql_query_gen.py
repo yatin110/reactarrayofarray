@@ -3,6 +3,7 @@ import cx_Oracle
 import pandas as pd
 import json
 from datetime import datetime
+import re
 
 # Set page configuration
 st.set_page_config(
@@ -31,6 +32,18 @@ if 'group_by_columns' not in st.session_state:
     st.session_state.group_by_columns = []
 if 'templates' not in st.session_state:
     st.session_state.templates = []
+if 'is_child_template' not in st.session_state:
+    st.session_state.is_child_template = False
+if 'parent_template_id' not in st.session_state:
+    st.session_state.parent_template_id = None
+if 'parent_derived_table' not in st.session_state:
+    st.session_state.parent_derived_table = None
+if 'parent_columns' not in st.session_state:
+    st.session_state.parent_columns = []
+if 'where_conditions' not in st.session_state:
+    st.session_state.where_conditions = []
+if 'filter_values' not in st.session_state:
+    st.session_state.filter_values = {}
 
 # Database connection function
 def connect_to_oracle(username, password, dsn):
@@ -69,8 +82,23 @@ def get_columns(connection, table_name):
     cursor.close()
     return columns
 
+# Get columns from a SQL query
+def get_columns_from_query(connection, sql_query):
+    cursor = connection.cursor()
+    try:
+        # Add a WHERE 1=0 to avoid actually fetching data
+        modified_query = f"SELECT * FROM ({sql_query}) WHERE 1=0"
+        cursor.execute(modified_query)
+        columns = [(col[0], str(col[1])) for col in cursor.description]
+        return columns
+    except Exception as e:
+        st.error(f"Error getting columns from query: {e}")
+        return []
+    finally:
+        cursor.close()
+
 # Save template to database
-def save_template(connection, template_name, sql_query, metadata):
+def save_template(connection, template_name, sql_query, metadata, parent_id=None):
     cursor = connection.cursor()
     try:
         # Check if SQL_TEMPLATES table exists, if not create it
@@ -86,8 +114,11 @@ def save_template(connection, template_name, sql_query, metadata):
                     template_name VARCHAR2(100) NOT NULL,
                     sql_query CLOB NOT NULL,
                     metadata CLOB NOT NULL,
+                    parent_id NUMBER NULL,
                     created_date DATE DEFAULT SYSDATE,
-                    modified_date DATE DEFAULT SYSDATE
+                    modified_date DATE DEFAULT SYSDATE,
+                    CONSTRAINT fk_parent_template FOREIGN KEY (parent_id) 
+                        REFERENCES SQL_TEMPLATES(template_id) ON DELETE CASCADE
                 )
             """)
             connection.commit()
@@ -107,16 +138,17 @@ def save_template(connection, template_name, sql_query, metadata):
                 UPDATE SQL_TEMPLATES 
                 SET sql_query = :query, 
                     metadata = :metadata,
+                    parent_id = :parent_id,
                     modified_date = SYSDATE
                 WHERE template_id = :id
-            """, query=sql_query, metadata=metadata, id=template_id)
+            """, query=sql_query, metadata=metadata, parent_id=parent_id, id=template_id)
             message = f"Template '{template_name}' updated successfully!"
         else:
             # Insert new template
             cursor.execute("""
-                INSERT INTO SQL_TEMPLATES (template_name, sql_query, metadata)
-                VALUES (:name, :query, :metadata)
-            """, name=template_name, query=sql_query, metadata=metadata)
+                INSERT INTO SQL_TEMPLATES (template_name, sql_query, metadata, parent_id)
+                VALUES (:name, :query, :metadata, :parent_id)
+            """, name=template_name, query=sql_query, metadata=metadata, parent_id=parent_id)
             message = f"Template '{template_name}' saved successfully!"
         
         connection.commit()
@@ -141,7 +173,7 @@ def get_templates(connection):
             return []
         
         cursor.execute("""
-            SELECT template_id, template_name, sql_query, metadata
+            SELECT template_id, template_name, sql_query, metadata, parent_id
             FROM SQL_TEMPLATES
             ORDER BY template_name
         """)
@@ -150,7 +182,8 @@ def get_templates(connection):
                 "id": row[0], 
                 "name": row[1], 
                 "query": row[2], 
-                "metadata": json.loads(row[3])
+                "metadata": json.loads(row[3]),
+                "parent_id": row[4]
             } 
             for row in cursor.fetchall()
         ]
@@ -166,7 +199,7 @@ def get_template_by_id(connection, template_id):
     cursor = connection.cursor()
     try:
         cursor.execute("""
-            SELECT template_id, template_name, sql_query, metadata
+            SELECT template_id, template_name, sql_query, metadata, parent_id
             FROM SQL_TEMPLATES
             WHERE template_id = :id
         """, id=template_id)
@@ -177,7 +210,8 @@ def get_template_by_id(connection, template_id):
                 "id": row[0], 
                 "name": row[1], 
                 "query": row[2], 
-                "metadata": json.loads(row[3])
+                "metadata": json.loads(row[3]),
+                "parent_id": row[4]
             }
         return None
     except Exception as e:
@@ -186,8 +220,16 @@ def get_template_by_id(connection, template_id):
     finally:
         cursor.close()
 
-# Generate SQL query based on user selections
-def generate_sql_query():
+# Get all parent templates (templates that have no parent)
+def get_parent_templates(templates):
+    return [t for t in templates if t["parent_id"] is None]
+
+# Get all child templates for a specific parent
+def get_child_templates(templates, parent_id):
+    return [t for t in templates if t["parent_id"] == parent_id]
+
+# Generate SQL query based on user selections for parent templates
+def generate_parent_sql_query():
     if not st.session_state.selected_tables:
         return "No tables selected"
     
@@ -231,18 +273,100 @@ def generate_sql_query():
     
     return sql_query
 
-# Reset the query builder
-def reset_query_builder():
+# Generate SQL query for child templates
+def generate_child_sql_query():
+    if not st.session_state.parent_template_id or not st.session_state.parent_derived_table:
+        return "No parent template selected"
+    
+    # Select clause
+    select_parts = []
+    for col in st.session_state.selected_columns:
+        column_name = col  # No table prefix needed as all columns come from the derived table
+        if col in st.session_state.aggregations and st.session_state.aggregations[col]:
+            agg_func = st.session_state.aggregations[col]
+            select_parts.append(f"{agg_func}({column_name}) AS {agg_func}_{column_name}")
+        else:
+            select_parts.append(f"{column_name}")
+    
+    select_clause = "SELECT " + ",\n       ".join(select_parts)
+    
+    # Get parent query
+    parent_template = get_template_by_id(st.session_state.connection, st.session_state.parent_template_id)
+    parent_query = parent_template["query"]
+    
+    # From clause with parent query as subquery
+    derived_table = st.session_state.parent_derived_table
+    from_clause = f"FROM ({parent_query}) {derived_table}"
+    
+    # Where clause
+    where_clause = ""
+    if st.session_state.where_conditions:
+        conditions = []
+        for condition in st.session_state.where_conditions:
+            column = condition["column"]
+            operator = condition["operator"]
+            
+            # Different handling based on operator type
+            if operator in ("IS NULL", "IS NOT NULL"):
+                conditions.append(f"{column} {operator}")
+            else:
+                # Format value based on data type
+                value_placeholder = condition["value_placeholder"]
+                conditions.append(f"{column} {operator} {value_placeholder}")
+        
+        where_clause = "\nWHERE " + " AND ".join(conditions)
+    
+    # Group by clause
+    group_by_clause = ""
+    if st.session_state.group_by_columns:
+        group_by_parts = []
+        for col in st.session_state.group_by_columns:
+            group_by_parts.append(col)
+        
+        group_by_clause = "\nGROUP BY " + ",\n         ".join(group_by_parts)
+    
+    # Complete SQL query
+    sql_query = f"{select_clause}\n{from_clause}{where_clause}{group_by_clause}"
+    
+    # Replace parameter placeholders with actual values for display
+    display_query = sql_query
+    for col, value in st.session_state.filter_values.items():
+        if value:
+            # Check if the value needs quotes (string types)
+            if isinstance(value, str):
+                value_str = f"'{value}'"
+            else:
+                value_str = str(value)
+                
+            # Replace the placeholder in the display query
+            placeholder = f":param_{col.replace('.', '_')}"
+            display_query = display_query.replace(placeholder, value_str)
+    
+    return display_query
+
+# Reset the query builder for parent template
+def reset_parent_query_builder():
     st.session_state.selected_tables = []
     st.session_state.joins = []
     st.session_state.selected_columns = []
     st.session_state.aggregations = {}
     st.session_state.group_by_columns = []
 
-# Load template data into the query builder
-def load_template_data(template_data):
+# Reset the query builder for child template
+def reset_child_query_builder():
+    st.session_state.parent_template_id = None
+    st.session_state.parent_derived_table = None
+    st.session_state.parent_columns = []
+    st.session_state.selected_columns = []
+    st.session_state.aggregations = {}
+    st.session_state.group_by_columns = []
+    st.session_state.where_conditions = []
+    st.session_state.filter_values = {}
+
+# Load template data into the parent query builder
+def load_parent_template_data(template_data):
     # Reset current state
-    reset_query_builder()
+    reset_parent_query_builder()
     
     metadata = template_data["metadata"]
     
@@ -265,6 +389,61 @@ def load_template_data(template_data):
     
     # Load group by columns
     st.session_state.group_by_columns = metadata["group_by_columns"]
+
+# Load template data into the child query builder
+def load_child_template_data(template_data):
+    # Reset current state
+    reset_child_query_builder()
+    
+    metadata = template_data["metadata"]
+    
+    # Load parent template info
+    st.session_state.parent_template_id = metadata["parent_template_id"]
+    st.session_state.parent_derived_table = metadata["parent_derived_table"]
+    
+    # Get parent template to extract parent columns
+    parent_template = get_template_by_id(st.session_state.connection, st.session_state.parent_template_id)
+    parent_query = parent_template["query"]
+    
+    # Get columns from parent query
+    st.session_state.parent_columns = get_columns_from_query(st.session_state.connection, parent_query)
+    
+    # Load selected columns
+    st.session_state.selected_columns = metadata["selected_columns"]
+    
+    # Load aggregations
+    st.session_state.aggregations = metadata["aggregations"]
+    
+    # Load group by columns
+    st.session_state.group_by_columns = metadata["group_by_columns"]
+    
+    # Load where conditions
+    st.session_state.where_conditions = metadata["where_conditions"]
+    
+    # Load filter values
+    st.session_state.filter_values = metadata.get("filter_values", {})
+
+# Switch to child template mode
+def switch_to_child_template_mode(parent_id):
+    st.session_state.is_child_template = True
+    st.session_state.parent_template_id = parent_id
+    
+    # Get parent template
+    parent_template = get_template_by_id(st.session_state.connection, parent_id)
+    parent_query = parent_template["query"]
+    
+    # Set default derived table name
+    st.session_state.parent_derived_table = "PARENT_DATA"
+    
+    # Get columns from parent query
+    st.session_state.parent_columns = get_columns_from_query(st.session_state.connection, parent_query)
+    
+    # Reset other selections
+    st.session_state.selected_columns = []
+    st.session_state.aggregations = {}
+    st.session_state.group_by_columns = []
+    st.session_state.where_conditions = []
+    st.session_state.filter_values = {}
 
 # Main application
 def main():
@@ -295,6 +474,40 @@ def main():
             
             if st.button("Refresh Templates"):
                 st.session_state.templates = get_templates(st.session_state.connection)
+            
+            # Template type selector
+            st.subheader("Template Type")
+            template_type = st.radio(
+                "Select template type:",
+                ["Parent Template", "Child Template"],
+                index=0 if not st.session_state.is_child_template else 1,
+                key="template_type_selector"
+            )
+            
+            if template_type == "Parent Template" and st.session_state.is_child_template:
+                if st.button("Switch to Parent Template Mode"):
+                    st.session_state.is_child_template = False
+                    reset_parent_query_builder()
+                    st.rerun()
+            
+            elif template_type == "Child Template" and not st.session_state.is_child_template:
+                # Select parent template
+                parent_templates = get_parent_templates(st.session_state.templates)
+                if not parent_templates:
+                    st.warning("No parent templates available. Create a parent template first.")
+                else:
+                    parent_options = {t["name"]: t["id"] for t in parent_templates}
+                    selected_parent = st.selectbox(
+                        "Select parent template:",
+                        options=list(parent_options.keys()),
+                        key="parent_template_selector"
+                    )
+                    
+                    parent_id = parent_options[selected_parent]
+                    
+                    if st.button("Use This Parent"):
+                        switch_to_child_template_mode(parent_id)
+                        st.rerun()
     
     # Main content
     if not st.session_state.connection:
@@ -311,206 +524,140 @@ def main():
         if not st.session_state.templates:
             st.info("No saved templates found.")
         else:
-            template_options = {t["name"]: t["id"] for t in st.session_state.templates}
-            selected_template = st.selectbox(
-                "Select a template to view:", 
-                options=list(template_options.keys()),
-                key="template_selector"
+            # Allow filtering by template type
+            template_filter = st.radio(
+                "Filter templates:",
+                ["All Templates", "Parent Templates", "Child Templates"],
+                horizontal=True,
+                key="template_filter"
             )
             
-            template_id = template_options[selected_template]
-            template = next((t for t in st.session_state.templates if t["id"] == template_id), None)
-            
-            if template:
-                st.subheader(f"Template: {template['name']}")
+            filtered_templates = st.session_state.templates
+            if template_filter == "Parent Templates":
+                filtered_templates = get_parent_templates(st.session_state.templates)
+            elif template_filter == "Child Templates":
+                filtered_templates = [t for t in st.session_state.templates if t["parent_id"] is not None]
                 
-                # Display SQL Query
-                st.markdown("### SQL Query")
-                st.code(template["query"], language="sql")
+            if not filtered_templates:
+                st.info(f"No {template_filter.lower()} found.")
+            else:
+                template_options = {t["name"]: t["id"] for t in filtered_templates}
+                selected_template = st.selectbox(
+                    "Select a template to view:", 
+                    options=list(template_options.keys()),
+                    key="template_selector"
+                )
                 
-                # Option to edit the template
-                if st.button("Edit this template", key="edit_template_button"):
-                    load_template_data(template)
-                    st.session_state.editing_template_id = template["id"]
-                    st.session_state.editing_template_name = template["name"]
-                    st.session_state.tab_index = 1  # Switch to Create/Edit tab
-                    st.rerun()
+                template_id = template_options[selected_template]
+                template = next((t for t in filtered_templates if t["id"] == template_id), None)
                 
-                # Option to run the query
-                if st.button("Run Query", key="run_query_button"):
-                    try:
-                        cursor = st.session_state.connection.cursor()
-                        cursor.execute(template["query"])
-                        columns = [col[0] for col in cursor.description]
-                        data = cursor.fetchall()
-                        df = pd.DataFrame(data, columns=columns)
-                        cursor.close()
+                if template:
+                    # Display template type
+                    template_type = "Parent Template" if template["parent_id"] is None else "Child Template"
+                    st.subheader(f"{template_type}: {template['name']}")
+                    
+                    # If it's a child template, show the parent
+                    if template["parent_id"] is not None:
+                        parent = get_template_by_id(st.session_state.connection, template["parent_id"])
+                        if parent:
+                            st.info(f"Based on parent template: {parent['name']}")
+                    
+                    # Display SQL Query
+                    st.markdown("### SQL Query")
+                    st.code(template["query"], language="sql")
+                    
+                    # Option to edit the template
+                    if st.button("Edit this template", key="edit_template_button"):
+                        if template["parent_id"] is None:
+                            # Load parent template
+                            load_parent_template_data(template)
+                            st.session_state.is_child_template = False
+                        else:
+                            # Load child template
+                            load_child_template_data(template)
+                            st.session_state.is_child_template = True
                         
-                        st.markdown("### Query Results")
-                        st.dataframe(df)
-                        
-                        # Option to download results
-                        csv = df.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            "Download results as CSV",
-                            csv,
-                            f"{template['name']}_results.csv",
-                            "text/csv",
-                            key="download_csv"
-                        )
-                    except Exception as e:
-                        st.error(f"Error executing query: {e}")
+                        st.session_state.editing_template_id = template["id"]
+                        st.session_state.editing_template_name = template["name"]
+                        st.rerun()
+                    
+                    # Option to create a child template from a parent
+                    if template["parent_id"] is None:
+                        if st.button("Create Child Template From This", key="create_child_button"):
+                            switch_to_child_template_mode(template["id"])
+                            st.session_state.is_child_template = True
+                            st.rerun()
+                    
+                    # Option to run the query
+                    if st.button("Run Query", key="run_query_button"):
+                        try:
+                            cursor = st.session_state.connection.cursor()
+                            cursor.execute(template["query"])
+                            columns = [col[0] for col in cursor.description]
+                            data = cursor.fetchall()
+                            df = pd.DataFrame(data, columns=columns)
+                            cursor.close()
+                            
+                            st.markdown("### Query Results")
+                            st.dataframe(df)
+                            
+                            # Option to download results
+                            csv = df.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                "Download results as CSV",
+                                csv,
+                                f"{template['name']}_results.csv",
+                                "text/csv",
+                                key="download_csv"
+                            )
+                        except Exception as e:
+                            st.error(f"Error executing query: {e}")
+                    
+                    # Show child templates if this is a parent
+                    if template["parent_id"] is None:
+                        child_templates = get_child_templates(st.session_state.templates, template["id"])
+                        if child_templates:
+                            st.markdown("### Child Templates")
+                            for child in child_templates:
+                                st.write(f"- {child['name']}")
     
     # Tab for creating or editing templates
     with tabs[1]:
         editing_mode = hasattr(st.session_state, 'editing_template_id')
         
         if editing_mode:
-            st.header(f"Edit Template: {st.session_state.editing_template_name}")
+            st.header(f"Edit {'Child' if st.session_state.is_child_template else 'Parent'} Template: {st.session_state.editing_template_name}")
             template_name = st.text_input("Template Name", value=st.session_state.editing_template_name, key="edit_template_name")
         else:
-            st.header("Create New SQL Template")
+            st.header(f"Create New {'Child' if st.session_state.is_child_template else 'Parent'} Template")
             template_name = st.text_input("Template Name", key="new_template_name")
         
-        # Select tables
-        st.subheader("1. Select Tables")
-        available_tables = [t for t in st.session_state.tables if t not in st.session_state.selected_tables]
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if available_tables:
-                table_to_add = st.selectbox("Available Tables", options=available_tables, key="table_to_add")
-                if st.button("Add Table", key="add_table_button"):
-                    st.session_state.selected_tables.append(table_to_add)
-                    # Get columns for the newly added table
-                    st.session_state.columns_info[table_to_add] = get_columns(st.session_state.connection, table_to_add)
-                    st.rerun()
-            else:
-                st.info("No more tables available")
-        
-        with col2:
-            if st.session_state.selected_tables:
-                st.write("Selected Tables:")
-                for i, table in enumerate(st.session_state.selected_tables):
-                    cols = st.columns([4, 1])
-                    with cols[0]:
-                        st.write(f"{i+1}. {table}")
-                    with cols[1]:
-                        if st.button("Remove", key=f"remove_table_{i}"):
-                            # Remove this table
-                            removed_table = st.session_state.selected_tables.pop(i)
-                            
-                            # Remove any columns from this table
-                            st.session_state.selected_columns = [
-                                col for col in st.session_state.selected_columns 
-                                if not col.startswith(f"{removed_table}.")
-                            ]
-                            
-                            # Remove any joins involving this table
-                            st.session_state.joins = [
-                                join for join in st.session_state.joins
-                                if not (join["source"].startswith(f"{removed_table}.") or 
-                                        join["target"].startswith(f"{removed_table}."))
-                            ]
-                            
-                            # Remove from group by
-                            st.session_state.group_by_columns = [
-                                col for col in st.session_state.group_by_columns
-                                if not col.startswith(f"{removed_table}.")
-                            ]
-                            
-                            # Remove aggregations
-                            keys_to_remove = [
-                                key for key in st.session_state.aggregations.keys()
-                                if key.startswith(f"{removed_table}.")
-                            ]
-                            for key in keys_to_remove:
-                                del st.session_state.aggregations[key]
-                                
-                            st.rerun()
-            else:
-                st.info("No tables selected yet")
-        
-        # Create joins between tables
-        if len(st.session_state.selected_tables) > 1:
-            st.subheader("2. Create Joins")
+        # Different UI based on template type
+        if st.session_state.is_child_template:
+            # CHILD TEMPLATE CREATION/EDITING
+            if not st.session_state.parent_template_id:
+                st.error("No parent template selected. Please select a parent template from the sidebar.")
+                return
             
-            # Collect all columns from all selected tables
-            all_columns = {}
-            for table in st.session_state.selected_tables:
-                if table in st.session_state.columns_info:
-                    all_columns[table] = [f"{table}.{col[0]}" for col in st.session_state.columns_info[table]]
+            # Show parent template information
+            parent_template = get_template_by_id(st.session_state.connection, st.session_state.parent_template_id)
+            st.subheader(f"1. Parent Template: {parent_template['name']}")
             
-            # Display existing joins
-            if st.session_state.joins:
-                st.write("Existing Joins:")
-                for i, join in enumerate(st.session_state.joins):
-                    cols = st.columns([4, 1])
-                    with cols[0]:
-                        st.write(f"{i+1}. {join['source']} = {join['target']}")
-                    with cols[1]:
-                        if st.button("Remove", key=f"remove_join_{i}"):
-                            st.session_state.joins.pop(i)
-                            st.rerun()
+            # Allow setting the alias for the parent query result
+            st.session_state.parent_derived_table = st.text_input(
+                "Alias for parent query result",
+                value=st.session_state.parent_derived_table or "PARENT_DATA",
+                key="parent_derived_table_name"
+            )
             
-            # Add new join
-            st.write("Add New Join:")
-            col1, col2, col3 = st.columns([3, 1, 3])
+            derived_table = st.session_state.parent_derived_table
             
-            with col1:
-                source_options = []
-                for table in st.session_state.selected_tables:
-                    if table in st.session_state.columns_info:
-                        for col in st.session_state.columns_info[table]:
-                            source_options.append(f"{table}.{col[0]}")
-                
-                source_column = st.selectbox("Source Column", options=source_options, key="source_column")
+            # Select columns from parent query
+            st.subheader("2. Select Columns")
             
-            with col2:
-                st.write("=")
-            
-            with col3:
-                target_options = []
-                if source_column:
-                    source_table = source_column.split(".")[0]
-                    for table in st.session_state.selected_tables:
-                        if table != source_table and table in st.session_state.columns_info:
-                            for col in st.session_state.columns_info[table]:
-                                target_options.append(f"{table}.{col[0]}")
-                
-                target_column = st.selectbox("Target Column", options=target_options, key="target_column")
-            
-            if source_column and target_column and st.button("Add Join", key="add_join_button"):
-                # Check if this join already exists
-                join_exists = any(
-                    (join["source"] == source_column and join["target"] == target_column) or
-                    (join["source"] == target_column and join["target"] == source_column)
-                    for join in st.session_state.joins
-                )
-                
-                if not join_exists:
-                    st.session_state.joins.append({
-                        "source": source_column,
-                        "target": target_column
-                    })
-                    st.rerun()
-                else:
-                    st.warning("This join already exists.")
-        
-        # Select columns and set aggregations
-        if st.session_state.selected_tables:
-            st.subheader("3. Select Columns and Aggregations")
-            
-            # Display all columns from selected tables
-            all_columns = []
-            for table in st.session_state.selected_tables:
-                if table in st.session_state.columns_info:
-                    for col in st.session_state.columns_info[table]:
-                        all_columns.append(f"{table}.{col[0]}")
-            
-            # Available columns (not yet selected)
-            available_columns = [col for col in all_columns if col not in st.session_state.selected_columns]
+            # Display available columns from parent query
+            available_columns = [col[0] for col in st.session_state.parent_columns 
+                                if col[0] not in st.session_state.selected_columns]
             
             col1, col2 = st.columns(2)
             
@@ -565,98 +712,52 @@ def main():
                             st.rerun()
             else:
                 st.info("No columns selected yet")
-        
-        # Group by settings
-        if st.session_state.aggregations and st.session_state.selected_columns:
-            st.subheader("4. Group By Columns")
             
-            # Get non-aggregated columns
-            non_agg_columns = [
-                col for col in st.session_state.selected_columns
-                if col not in st.session_state.aggregations or not st.session_state.aggregations[col]
-            ]
+            # Add WHERE conditions
+            st.subheader("3. Where Conditions")
             
-            # Display current group by columns
-            if st.session_state.group_by_columns:
-                st.write("Current Group By Columns:")
-                for i, col in enumerate(st.session_state.group_by_columns):
-                    cols = st.columns([4, 1])
-                    with cols[0]:
-                        st.write(f"{i+1}. {col}")
-                    with cols[1]:
-                        if st.button("Remove", key=f"remove_group_{i}"):
-                            st.session_state.group_by_columns.remove(col)
-                            st.rerun()
-            
-            # Add columns to group by
-            available_for_group_by = [
-                col for col in non_agg_columns
-                if col not in st.session_state.group_by_columns
-            ]
-            
-            if available_for_group_by:
-                col_to_group = st.selectbox(
-                    "Add Column to Group By", 
-                    options=available_for_group_by,
-                    key="group_by_column"
-                )
-                
-                if st.button("Add to Group By", key="add_group_by"):
-                    st.session_state.group_by_columns.append(col_to_group)
-                    st.rerun()
-        
-        # Generate SQL Query
-        if st.session_state.selected_columns:
-            st.subheader("5. Generated SQL Query")
-            
-            sql_query = generate_sql_query()
-            st.code(sql_query, language="sql")
-            
-            # Save template option
-            if template_name.strip():
-                # Prepare metadata for saving
-                metadata = {
-                    "selected_tables": st.session_state.selected_tables,
-                    "joins": st.session_state.joins,
-                    "selected_columns": st.session_state.selected_columns,
-                    "aggregations": st.session_state.aggregations,
-                    "group_by_columns": st.session_state.group_by_columns
-                }
-                
-                metadata_json = json.dumps(metadata)
-                
-                if st.button("Save Template", key="save_template_button"):
-                    success, message = save_template(
-                        st.session_state.connection,
-                        template_name,
-                        sql_query,
-                        metadata_json
-                    )
+            # Display existing conditions
+            if st.session_state.where_conditions:
+                st.write("Current Filter Conditions:")
+                for i, condition in enumerate(st.session_state.where_conditions):
+                    cols = st.columns([3, 1, 2, 1])
                     
-                    if success:
-                        st.success(message)
-                        st.session_state.templates = get_templates(st.session_state.connection)
-                        
-                        # Clear editing state if we were editing
-                        if hasattr(st.session_state, 'editing_template_id'):
-                            delattr(st.session_state, 'editing_template_id')
-                            delattr(st.session_state, 'editing_template_name')
+                    with cols[0]:
+                        st.write(condition["column"])
+                    
+                    with cols[1]:
+                        st.write(condition["operator"])
+                    
+                    with cols[2]:
+                        # Display the value or placeholder for the condition
+                        if condition["operator"] in ("IS NULL", "IS NOT NULL"):
+                            st.write("-")
+                        else:
+                            col_name = condition["column"]
+                            value_key = f"filter_value_{i}"
                             
-                        # Reset the form for a new template
-                        reset_query_builder()
-                        st.rerun()
-                    else:
-                        st.error(message)
-            else:
-                st.warning("Please enter a template name before saving.")
-        
-        # Reset button
-        if st.button("Reset Form", key="reset_form"):
-            reset_query_builder()
-            if hasattr(st.session_state, 'editing_template_id'):
-                delattr(st.session_state, 'editing_template_id')
-                delattr(st.session_state, 'editing_template_name')
-            st.rerun()
-
-if __name__ == "__main__":
-    main()
+                            # Get column data type to determine input type
+                            col_type = next((c[1] for c in st.session_state.parent_columns 
+                                            if c[0] == col_name), "VARCHAR2")
+                            
+                            # Default value from stored filter values
+                            default_value = st.session_state.filter_values.get(col_name, "")
+                            
+                            # Customize input based on data type
+                            if "NUMBER" in col_type:
+                                try:
+                                    value = st.number_input(
+                                        "Value", 
+                                        value=float(default_value) if default_value else 0.0,
+                                        key=value_key
+                                    )
+                                except ValueError:
+                                    value = st.number_input("Value", value=0.0, key=value_key)
+                            elif "DATE" in col_type:
+                                value = st.text_input(
+                                    "Date (YYYY-MM-DD)", 
+                                    value=default_value,
+                                    key=value_key
+                                )
+                            else:  # String type
+                                value = st.text_input(
