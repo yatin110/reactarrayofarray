@@ -1,0 +1,863 @@
+import streamlit as st
+import cx_Oracle
+import pandas as pd
+from sqlalchemy import create_engine
+
+# Database connection setup
+def get_db_connection():
+    try:
+        connection_string = st.session_state.get('connection_string', '')
+        if not connection_string:
+            return None
+        engine = create_engine(f'oracle+cx_oracle://{connection_string}')
+        return engine
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        return None
+
+# Get tables from Oracle DB
+def get_tables(engine):
+    if engine is None:
+        return []
+    query = """
+    SELECT table_name FROM user_tables
+    UNION
+    SELECT view_name FROM user_views
+    ORDER BY 1
+    """
+    return pd.read_sql(query, engine)['TABLE_NAME'].tolist()
+
+# Get columns for a specific table
+def get_columns(engine, table_name):
+    if engine is None or not table_name:
+        return []
+    query = f"""
+    SELECT column_name, data_type
+    FROM user_tab_columns
+    WHERE table_name = '{table_name}'
+    ORDER BY column_id
+    """
+    return pd.read_sql(query, engine)
+
+# Get all templates
+def get_templates(engine, parent_only=False):
+    if engine is None:
+        return []
+    where_clause = "WHERE parent_id IS NULL" if parent_only else ""
+    query = f"""
+    SELECT template_id, template_name, is_parent
+    FROM sql_templates
+    {where_clause}
+    ORDER BY template_name
+    """
+    try:
+        return pd.read_sql(query, engine)
+    except:
+        st.warning("SQL templates table doesn't exist yet. It will be created when you save your first template.")
+        return pd.DataFrame(columns=['TEMPLATE_ID', 'TEMPLATE_NAME', 'IS_PARENT'])
+
+# Get template details
+def get_template_details(engine, template_id):
+    if engine is None:
+        return None
+    query = f"""
+    SELECT * FROM sql_templates
+    WHERE template_id = {template_id}
+    """
+    return pd.read_sql(query, engine).iloc[0]
+
+# Save template to database
+def save_template(engine, template_data):
+    if engine is None:
+        return False
+    
+    # Check if SQL_TEMPLATES table exists, create if not
+    with engine.connect() as conn:
+        table_exists = conn.execute("""
+        SELECT COUNT(*) FROM user_tables WHERE table_name = 'SQL_TEMPLATES'
+        """).scalar()
+        
+        if not table_exists:
+            conn.execute("""
+            CREATE TABLE sql_templates (
+                template_id NUMBER PRIMARY KEY,
+                template_name VARCHAR2(100) NOT NULL,
+                sql_query CLOB NOT NULL,
+                is_parent NUMBER(1) DEFAULT 1,
+                parent_id NUMBER,
+                template_data CLOB,
+                created_date DATE DEFAULT SYSDATE,
+                modified_date DATE DEFAULT SYSDATE,
+                CONSTRAINT fk_parent FOREIGN KEY (parent_id) 
+                REFERENCES sql_templates(template_id)
+            )
+            """)
+            
+            conn.execute("""
+            CREATE SEQUENCE sql_template_seq START WITH 1 INCREMENT BY 1
+            """)
+    
+    # Insert or update template
+    with engine.connect() as conn:
+        if 'template_id' in template_data and template_data['template_id']:
+            # Update existing template
+            template_id = template_data['template_id']
+            conn.execute(f"""
+            UPDATE sql_templates SET 
+                template_name = '{template_data['template_name']}',
+                sql_query = '{template_data['sql_query']}',
+                is_parent = {1 if template_data['is_parent'] else 0},
+                parent_id = {template_data.get('parent_id', 'NULL')},
+                template_data = '{template_data['template_data']}',
+                modified_date = SYSDATE
+            WHERE template_id = {template_id}
+            """)
+        else:
+            # Insert new template
+            template_id = conn.execute("SELECT sql_template_seq.NEXTVAL FROM dual").scalar()
+            parent_id = f"{template_data.get('parent_id', 'NULL')}"
+            if parent_id == 'None' or parent_id == '':
+                parent_id = 'NULL'
+                
+            conn.execute(f"""
+            INSERT INTO sql_templates (
+                template_id, template_name, sql_query, is_parent, parent_id, template_data
+            ) VALUES (
+                {template_id},
+                '{template_data['template_name']}',
+                '{template_data['sql_query']}',
+                {1 if template_data['is_parent'] else 0},
+                {parent_id},
+                '{template_data['template_data']}'
+            )
+            """)
+    
+    return True
+
+# Generate SQL query based on user selections
+def generate_sql_query(tables, joins, columns, aggregations, group_by_cols, where_conditions=None):
+    # Prepare SELECT clause
+    select_clause = []
+    for col, agg in zip(columns, aggregations):
+        if agg == 'None':
+            select_clause.append(col)
+        else:
+            col_name = col.split('.')[-1]
+            select_clause.append(f"{agg}({col}) as {agg}_{col_name}")
+    
+    # Prepare FROM clause
+    from_clause = tables[0]
+    
+    # Prepare JOIN clause
+    join_clause = []
+    for join in joins:
+        if join['table1'] and join['table2'] and join['column1'] and join['column2']:
+            join_clause.append(f"JOIN {join['table2']} ON {join['table1']}.{join['column1']} = {join['table2']}.{join['column2']}")
+    
+    # Prepare WHERE clause
+    where_clause = ""
+    if where_conditions and len(where_conditions) > 0:
+        conditions = []
+        for condition in where_conditions:
+            if condition['column'] and condition['operator'] and condition['value']:
+                value = condition['value']
+                # Check if value should be quoted
+                if condition['operator'] in ['=', '<>', '>', '<', '>=', '<=']:
+                    if not value.isdigit():
+                        value = f"'{value}'"
+                    conditions.append(f"{condition['column']} {condition['operator']} {value}")
+                elif condition['operator'] == 'LIKE':
+                    conditions.append(f"{condition['column']} LIKE '%{value}%'")
+                elif condition['operator'] == 'IN':
+                    values = [f"'{v.strip()}'" for v in value.split(',')]
+                    conditions.append(f"{condition['column']} IN ({', '.join(values)})")
+        
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+    
+    # Prepare GROUP BY clause
+    group_by_clause = ""
+    if group_by_cols and len(group_by_cols) > 0:
+        group_by_clause = "GROUP BY " + ", ".join(group_by_cols)
+    
+    # Combine all clauses
+    sql_parts = [
+        "SELECT " + ", ".join(select_clause),
+        "FROM " + from_clause
+    ]
+    
+    if join_clause:
+        sql_parts.extend(join_clause)
+    
+    if where_clause:
+        sql_parts.append(where_clause)
+    
+    if group_by_clause:
+        sql_parts.append(group_by_clause)
+    
+    return "\n".join(sql_parts)
+
+# Function to parse a SQL query (simplified for this example)
+def parse_parent_sql(sql_query):
+    # This is a simplified parser - in a real app, you'd use a proper SQL parser
+    select_clause = sql_query.split("FROM")[0].replace("SELECT", "").strip()
+    columns = [col.strip() for col in select_clause.split(",")]
+    return columns
+
+def main():
+    st.set_page_config(
+        page_title="SQL Template Manager",
+        layout="wide"
+    )
+    
+    st.title("SQL Template Manager")
+    
+    # Initialize session state
+    if 'db_connected' not in st.session_state:
+        st.session_state.db_connected = False
+    
+    # Database Connection Section
+    with st.expander("Database Connection", expanded=not st.session_state.db_connected):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            connection_string = st.text_input(
+                "Connection String (username/password@hostname:port/service_name)",
+                value=st.session_state.get('connection_string', ''),
+                type="password"
+            )
+        
+        with col2:
+            if st.button("Connect"):
+                st.session_state.connection_string = connection_string
+                engine = get_db_connection()
+                if engine:
+                    with engine.connect() as conn:
+                        st.session_state.db_connected = True
+                        st.success("Connected to database!")
+                else:
+                    st.error("Failed to connect to database.")
+    
+    # Main Application (only show if connected)
+    if st.session_state.db_connected:
+        engine = get_db_connection()
+        
+        # Main navigation
+        st.sidebar.title("Navigation")
+        app_mode = st.sidebar.radio("Select Mode", ["Create Template", "Edit Template", "View Templates"])
+        
+        if app_mode == "Create Template":
+            create_template(engine)
+        elif app_mode == "Edit Template":
+            edit_template(engine)
+        elif app_mode == "View Templates":
+            view_templates(engine)
+
+def create_template(engine):
+    st.header("Create SQL Template")
+    
+    # Choose template type
+    template_type = st.radio("Select Template Type", ["Parent Template", "Child Template"])
+    
+    if template_type == "Parent Template":
+        create_parent_template(engine)
+    else:
+        create_child_template(engine)
+
+def create_parent_template(engine):
+    st.subheader("Create Parent Template")
+    
+    # Get all tables
+    all_tables = get_tables(engine)
+    
+    # Template name
+    template_name = st.text_input("Template Name", key="parent_template_name")
+    
+    # Table selection
+    if all_tables:
+        selected_table = st.selectbox("Select Base Table", all_tables, key="parent_base_table")
+        
+        if selected_table:
+            # Get columns for the selected table
+            base_columns_df = get_columns(engine, selected_table)
+            
+            # Join configuration
+            st.subheader("Table Joins")
+            
+            joins = []
+            for i in range(3):  # Allow up to 3 joins
+                with st.expander(f"Join {i+1}", expanded=i==0):
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        table1 = st.selectbox("Table 1", [selected_table] + [j.get('table2', '') for j in joins if j.get('table2')], 
+                                             key=f"join_{i}_table1")
+                    
+                    with col2:
+                        join_table = st.selectbox("Join Table", [t for t in all_tables if t != selected_table], 
+                                                key=f"join_{i}_table2")
+                    
+                    if table1 and join_table:
+                        with col3:
+                            table1_cols = get_columns(engine, table1)['COLUMN_NAME'].tolist()
+                            col1 = st.selectbox("Column from Table 1", table1_cols, key=f"join_{i}_col1")
+                        
+                        with col4:
+                            table2_cols = get_columns(engine, join_table)['COLUMN_NAME'].tolist()
+                            col2 = st.selectbox("Column from Join Table", table2_cols, key=f"join_{i}_col2")
+                        
+                        joins.append({
+                            'table1': table1,
+                            'table2': join_table,
+                            'column1': col1,
+                            'column2': col2
+                        })
+            
+            # Column selection and aggregation
+            st.subheader("Column Selection")
+            
+            # Get all available columns from all tables
+            all_columns = []
+            all_columns.extend([f"{selected_table}.{col}" for col in base_columns_df['COLUMN_NAME'].tolist()])
+            
+            for join in joins:
+                if join.get('table2'):
+                    join_cols = get_columns(engine, join.get('table2'))
+                    all_columns.extend([f"{join.get('table2')}.{col}" for col in join_cols['COLUMN_NAME'].tolist()])
+            
+            # Column selection with aggregation
+            selected_columns = []
+            aggregations = []
+            group_by_cols = []
+            
+            st.write("Select columns and aggregations:")
+            
+            for i in range(min(10, len(all_columns))):  # Limit to 10 columns for simplicity
+                col1, col2, col3 = st.columns([3, 2, 1])
+                
+                with col1:
+                    column = st.selectbox(f"Column {i+1}", [''] + all_columns, key=f"column_{i}")
+                
+                with col2:
+                    agg = st.selectbox(f"Aggregation", ['None', 'SUM', 'AVG', 'COUNT', 'MIN', 'MAX'], key=f"agg_{i}")
+                
+                with col3:
+                    group_by = st.checkbox("Group By", key=f"group_by_{i}", disabled=(agg != 'None'))
+                
+                if column:
+                    selected_columns.append(column)
+                    aggregations.append(agg)
+                    if group_by and agg == 'None':
+                        group_by_cols.append(column)
+            
+            # Generate SQL query
+            if selected_columns:
+                sql_query = generate_sql_query(
+                    [selected_table], 
+                    joins, 
+                    selected_columns, 
+                    aggregations, 
+                    group_by_cols
+                )
+                
+                st.subheader("Generated SQL Query")
+                st.code(sql_query, language="sql")
+                
+                # Save template
+                if st.button("Save Template"):
+                    if not template_name:
+                        st.error("Please provide a template name")
+                    else:
+                        # Prepare template data
+                        template_data = {
+                            'template_name': template_name,
+                            'sql_query': sql_query,
+                            'is_parent': True,
+                            'template_data': str({
+                                'base_table': selected_table,
+                                'joins': joins,
+                                'columns': selected_columns,
+                                'aggregations': aggregations,
+                                'group_by': group_by_cols
+                            })
+                        }
+                        
+                        if save_template(engine, template_data):
+                            st.success("Template saved successfully!")
+                        else:
+                            st.error("Failed to save template")
+    else:
+        st.warning("No tables found in the database or connection issue.")
+
+def create_child_template(engine):
+    st.subheader("Create Child Template")
+    
+    # Get parent templates
+    parent_templates = get_templates(engine, parent_only=True)
+    
+    if not parent_templates.empty:
+        # Template name
+        template_name = st.text_input("Child Template Name", key="child_template_name")
+        
+        # Parent template selection
+        selected_parent = st.selectbox(
+            "Select Parent Template", 
+            parent_templates['TEMPLATE_NAME'].tolist(),
+            key="parent_template_selection"
+        )
+        
+        if selected_parent:
+            # Get parent template details
+            parent_id = parent_templates[parent_templates['TEMPLATE_NAME'] == selected_parent]['TEMPLATE_ID'].iloc[0]
+            parent_details = get_template_details(engine, parent_id)
+            
+            if parent_details is not None:
+                parent_sql = parent_details['SQL_QUERY']
+                
+                # Parse parent SQL to get available columns
+                available_columns = parse_parent_sql(parent_sql)
+                
+                # Column selection
+                st.subheader("Select Columns")
+                selected_columns = st.multiselect("Columns", available_columns)
+                
+                # Filter conditions
+                st.subheader("Filter Conditions")
+                
+                where_conditions = []
+                for i in range(3):  # Allow up to 3 conditions
+                    with st.expander(f"Condition {i+1}", expanded=i==0):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            column = st.selectbox("Column", [''] + available_columns, key=f"where_col_{i}")
+                        
+                        with col2:
+                            operator = st.selectbox("Operator", ['=', '<>', '>', '<', '>=', '<=', 'LIKE', 'IN'], key=f"where_op_{i}")
+                        
+                        with col3:
+                            value = st.text_input("Value", key=f"where_val_{i}")
+                        
+                        if column and operator:
+                            where_conditions.append({
+                                'column': column,
+                                'operator': operator,
+                                'value': value
+                            })
+                
+                # Generate child SQL
+                if selected_columns:
+                    # Extract the main parts of the parent query
+                    parent_from_part = parent_sql.split("FROM", 1)[1]
+                    if "WHERE" in parent_from_part:
+                        parent_from_part = parent_from_part.split("WHERE", 1)[0]
+                    if "GROUP BY" in parent_from_part:
+                        parent_from_part = parent_from_part.split("GROUP BY", 1)[0]
+                    
+                    # Create the child query
+                    child_sql = f"SELECT {', '.join(selected_columns)}\nFROM{parent_from_part}"
+                    
+                    # Add WHERE clause if needed
+                    if where_conditions:
+                        conditions = []
+                        for condition in where_conditions:
+                            if condition['column'] and condition['operator'] and condition['value']:
+                                value = condition['value']
+                                if condition['operator'] in ['=', '<>', '>', '<', '>=', '<=']:
+                                    if not value.isdigit():
+                                        value = f"'{value}'"
+                                    conditions.append(f"{condition['column']} {condition['operator']} {value}")
+                                elif condition['operator'] == 'LIKE':
+                                    conditions.append(f"{condition['column']} LIKE '%{value}%'")
+                                elif condition['operator'] == 'IN':
+                                    values = [f"'{v.strip()}'" for v in value.split(',')]
+                                    conditions.append(f"{condition['column']} IN ({', '.join(values)})")
+                        
+                        if conditions:
+                            child_sql += "\nWHERE " + " AND ".join(conditions)
+                    
+                    st.subheader("Generated SQL Query")
+                    st.code(child_sql, language="sql")
+                    
+                    # Save template
+                    if st.button("Save Child Template"):
+                        if not template_name:
+                            st.error("Please provide a template name")
+                        else:
+                            # Prepare template data
+                            template_data = {
+                                'template_name': template_name,
+                                'sql_query': child_sql,
+                                'is_parent': False,
+                                'parent_id': parent_id,
+                                'template_data': str({
+                                    'parent_id': parent_id,
+                                    'parent_name': selected_parent,
+                                    'columns': selected_columns,
+                                    'where_conditions': where_conditions
+                                })
+                            }
+                            
+                            if save_template(engine, template_data):
+                                st.success("Child template saved successfully!")
+                            else:
+                                st.error("Failed to save template")
+    else:
+        st.warning("No parent templates found. Please create a parent template first.")
+
+def edit_template(engine):
+    st.header("Edit SQL Template")
+    
+    # Get all templates
+    templates = get_templates(engine)
+    
+    if not templates.empty:
+        selected_template = st.selectbox(
+            "Select Template to Edit", 
+            templates['TEMPLATE_NAME'].tolist(),
+            key="edit_template_selection"
+        )
+        
+        if selected_template:
+            # Get template details
+            template_id = templates[templates['TEMPLATE_NAME'] == selected_template]['TEMPLATE_ID'].iloc[0]
+            is_parent = templates[templates['TEMPLATE_NAME'] == selected_template]['IS_PARENT'].iloc[0]
+            
+            template_details = get_template_details(engine, template_id)
+            
+            if template_details is not None:
+                # Show current SQL
+                st.subheader("Current SQL Query")
+                st.code(template_details['SQL_QUERY'], language="sql")
+                
+                # Edit mode based on template type
+                if is_parent:
+                    edit_parent_template(engine, template_details)
+                else:
+                    edit_child_template(engine, template_details)
+    else:
+        st.warning("No templates found. Please create a template first.")
+
+def edit_parent_template(engine, template_details):
+    st.subheader("Edit Parent Template")
+    
+    # Template name
+    template_name = st.text_input("Template Name", value=template_details['TEMPLATE_NAME'], key="edit_parent_name")
+    
+    # Get template data
+    template_data = eval(template_details['TEMPLATE_DATA'])
+    
+    # Get all tables
+    all_tables = get_tables(engine)
+    
+    # Base table (read-only in edit mode)
+    st.write(f"Base Table: {template_data['base_table']}")
+    selected_table = template_data['base_table']
+    
+    # Edit joins
+    st.subheader("Edit Table Joins")
+    
+    joins = template_data['joins'].copy()
+    for i, join in enumerate(joins):
+        with st.expander(f"Join {i+1}", expanded=True):
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.write(f"Table 1: {join['table1']}")
+            
+            with col2:
+                new_join_table = st.selectbox("Join Table", all_tables, 
+                                          index=all_tables.index(join['table2']) if join['table2'] in all_tables else 0,
+                                          key=f"edit_join_{i}_table2")
+            
+            if new_join_table:
+                with col3:
+                    table1_cols = get_columns(engine, join['table1'])['COLUMN_NAME'].tolist()
+                    new_col1 = st.selectbox("Column from Table 1", table1_cols, 
+                                         index=table1_cols.index(join['column1']) if join['column1'] in table1_cols else 0,
+                                         key=f"edit_join_{i}_col1")
+                
+                with col4:
+                    table2_cols = get_columns(engine, new_join_table)['COLUMN_NAME'].tolist()
+                    new_col2 = st.selectbox("Column from Join Table", table2_cols, 
+                                         index=table2_cols.index(join['column2']) if join['column2'] in table2_cols and new_join_table == join['table2'] else 0,
+                                         key=f"edit_join_{i}_col2")
+                
+                joins[i] = {
+                    'table1': join['table1'],
+                    'table2': new_join_table,
+                    'column1': new_col1,
+                    'column2': new_col2
+                }
+    
+    # Get all available columns
+    all_columns = []
+    all_columns.extend([f"{selected_table}.{col}" for col in get_columns(engine, selected_table)['COLUMN_NAME'].tolist()])
+    
+    for join in joins:
+        if join.get('table2'):
+            join_cols = get_columns(engine, join.get('table2'))
+            all_columns.extend([f"{join.get('table2')}.{col}" for col in join_cols['COLUMN_NAME'].tolist()])
+    
+    # Edit column selection and aggregation
+    st.subheader("Edit Column Selection")
+    
+    selected_columns = template_data['columns'].copy()
+    aggregations = template_data['aggregations'].copy()
+    group_by_cols = template_data['group_by'].copy()
+    
+    # Make sure we have enough placeholders
+    while len(selected_columns) < 10:
+        selected_columns.append('')
+        aggregations.append('None')
+    
+    new_selected_columns = []
+    new_aggregations = []
+    new_group_by_cols = []
+    
+    for i in range(10):  # Limit to 10 columns for simplicity
+        col1, col2, col3 = st.columns([3, 2, 1])
+        
+        with col1:
+            column = st.selectbox(f"Column {i+1}", [''] + all_columns, 
+                              index=(all_columns.index(selected_columns[i]) + 1) if i < len(selected_columns) and selected_columns[i] in all_columns else 0,
+                              key=f"edit_column_{i}")
+        
+        with col2:
+            agg_options = ['None', 'SUM', 'AVG', 'COUNT', 'MIN', 'MAX']
+            agg = st.selectbox(f"Aggregation", agg_options, 
+                            index=agg_options.index(aggregations[i]) if i < len(aggregations) else 0,
+                            key=f"edit_agg_{i}")
+        
+        with col3:
+            is_in_group_by = selected_columns[i] in group_by_cols if i < len(selected_columns) else False
+            group_by = st.checkbox("Group By", value=is_in_group_by, 
+                                key=f"edit_group_by_{i}", disabled=(agg != 'None'))
+        
+        if column:
+            new_selected_columns.append(column)
+            new_aggregations.append(agg)
+            if group_by and agg == 'None':
+                new_group_by_cols.append(column)
+    
+    # Generate SQL query
+    if new_selected_columns:
+        sql_query = generate_sql_query(
+            [selected_table], 
+            joins, 
+            new_selected_columns, 
+            new_aggregations, 
+            new_group_by_cols
+        )
+        
+        st.subheader("Updated SQL Query")
+        st.code(sql_query, language="sql")
+        
+        # Save updated template
+        if st.button("Save Updated Template"):
+            if not template_name:
+                st.error("Please provide a template name")
+            else:
+                # Prepare template data
+                updated_template_data = {
+                    'template_id': template_details['TEMPLATE_ID'],
+                    'template_name': template_name,
+                    'sql_query': sql_query,
+                    'is_parent': True,
+                    'template_data': str({
+                        'base_table': selected_table,
+                        'joins': joins,
+                        'columns': new_selected_columns,
+                        'aggregations': new_aggregations,
+                        'group_by': new_group_by_cols
+                    })
+                }
+                
+                if save_template(engine, updated_template_data):
+                    st.success("Template updated successfully!")
+                else:
+                    st.error("Failed to update template")
+
+def edit_child_template(engine, template_details):
+    st.subheader("Edit Child Template")
+    
+    # Template name
+    template_name = st.text_input("Template Name", value=template_details['TEMPLATE_NAME'], key="edit_child_name")
+    
+    # Get template data
+    template_data = eval(template_details['TEMPLATE_DATA'])
+    
+    # Get parent template details
+    parent_id = template_details['PARENT_ID']
+    parent_details = get_template_details(engine, parent_id)
+    
+    if parent_details is not None:
+        st.write(f"Parent Template: {parent_details['TEMPLATE_NAME']}")
+        
+        parent_sql = parent_details['SQL_QUERY']
+        
+        # Parse parent SQL to get available columns
+        available_columns = parse_parent_sql(parent_sql)
+        
+        # Column selection
+        st.subheader("Select Columns")
+        selected_columns = st.multiselect("Columns", available_columns, 
+                                      default=template_data['columns'],
+                                      key="edit_child_columns")
+        
+        # Filter conditions
+        st.subheader("Filter Conditions")
+        
+        where_conditions = template_data.get('where_conditions', []).copy()
+        # Ensure we have at least 3 condition slots
+        while len(where_conditions) < 3:
+            where_conditions.append({'column': '', 'operator': '=', 'value': ''})
+        
+        new_where_conditions = []
+        for i in range(3):  # Allow up to 3 conditions
+            with st.expander(f"Condition {i+1}", expanded=i < len(template_data.get('where_conditions', []))):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    column = st.selectbox("Column", [''] + available_columns, 
+                                       index=(available_columns.index(where_conditions[i]['column']) + 1) if i < len(where_conditions) and where_conditions[i]['column'] in available_columns else 0,
+                                       key=f"edit_where_col_{i}")
+                
+                with col2:
+                    operators = ['=', '<>', '>', '<', '>=', '<=', 'LIKE', 'IN']
+                    operator = st.selectbox("Operator", operators, 
+                                         index=operators.index(where_conditions[i]['operator']) if i < len(where_conditions) else 0,
+                                         key=f"edit_where_op_{i}")
+                
+                with col3:
+                    value = st.text_input("Value", 
+                                       value=where_conditions[i]['value'] if i < len(where_conditions) else '',
+                                       key=f"edit_where_val_{i}")
+                
+                if column and operator:
+                    new_where_conditions.append({
+                        'column': column,
+                        'operator': operator,
+                        'value': value
+                    })
+        
+        # Generate child SQL
+        if selected_columns:
+            # Extract the main parts of the parent query
+            parent_from_part = parent_sql.split("FROM", 1)[1]
+            if "WHERE" in parent_from_part:
+                parent_from_part = parent_from_part.split("WHERE", 1)[0]
+            if "GROUP BY" in parent_from_part:
+                parent_from_part = parent_from_part.split("GROUP BY", 1)[0]
+            
+            # Create the child query
+            child_sql = f"SELECT {', '.join(selected_columns)}\nFROM{parent_from_part}"
+            
+            # Add WHERE clause if needed
+            if new_where_conditions:
+                conditions = []
+                for condition in new_where_conditions:
+                    if condition['column'] and condition['operator'] and condition['value']:
+                        value = condition['value']
+                        if condition['operator'] in ['=', '<>', '>', '<', '>=', '<=']:
+                            if not value.isdigit():
+                                value = f"'{value}'"
+                            conditions.append(f"{condition['column']} {condition['operator']} {value}")
+                        elif condition['operator'] == 'LIKE':
+                            conditions.append(f"{condition['column']} LIKE '%{value}%'")
+                        elif condition['operator'] == 'IN':
+                            values = [f"'{v.strip()}'" for v in value.split(',')]
+                            conditions.append(f"{condition['column']} IN ({', '.join(values)})")
+                
+                if conditions:
+                    child_sql += "\nWHERE " + " AND ".join(conditions)
+            
+            st.subheader("Updated SQL Query")
+            st.code(child_sql, language="sql")
+            
+            # Save template
+            if st.button("Save Updated Template"):
+                if not template_name:
+                    st.error("Please provide a template name")
+                else:
+                    # Prepare template data
+                    updated_template_data = {
+                        'template_id': template_details['TEMPLATE_ID'],
+                        'template_name': template_name,
+                        'sql_query': child_sql,
+                        'is_parent': False,
+                        'parent_id': parent_id,
+                        'template_data': str({
+                            'parent_id': parent_id,
+                            'parent_name': parent_details['TEMPLATE_NAME'],
+                            'columns': selected_columns,
+                            'where_conditions': new_where_conditions
+                        })
+                    }
+                    
+                    if save_template(engine, updated_template_data):
+                        st.success("Child template updated successfully!")
+                    else:
+                        st.error("Failed to update template")
+
+def view_templates(engine):
+    st.header("View SQL Templates")
+    
+    # Get all templates
+    templates = get_templates(engine)
+    
+    if not templates.empty:
+        # Display templates table
+        st.dataframe(templates[['TEMPLATE_ID', 'TEMPLATE_NAME', 'IS_PARENT']])
+        
+        # View specific template
+        selected_template = st.selectbox(
+            "Select Template to View", 
+            templates['TEMPLATE_NAME'].tolist(),
+            key="view_template_selection"
+        )
+        
+        if selected_template:
+            # Get template details
+            template_id = templates[templates['TEMPLATE_NAME'] == selected_template]['TEMPLATE_ID'].iloc[0]
+            template_details = get_template_details(engine, template_id)
+            
+            if template_details is not None:
+                # Show template info
+                st.subheader(f"Template: {template_details['TEMPLATE_NAME']}")
+                st.write(f"Type: {'Parent' if template_details['IS_PARENT'] == 1 else 'Child'}")
+                
+                if template_details['PARENT_ID'] is not None:
+                    parent_details = get_template_details(engine, template_details['PARENT_ID'])
+                    if parent_details is not None:
+                        st.write(f"Parent Template: {parent_details['TEMPLATE_NAME']}")
+                
+                # Show SQL
+                st.subheader("SQL Query")
+                st.code(template_details['SQL_QUERY'], language="sql")
+                
+                # Execute query option
+                if st.button("Execute Query"):
+                    try:
+                        # Execute query
+                        engine = get_db_connection()
+                        result = pd.read_sql(template_details['SQL_QUERY'], engine)
+                        
+                        # Show results
+                        st.subheader("Query Results")
+                        st.dataframe(result)
+                        
+                        # Allow download as CSV
+                        csv = result.to_csv(index=False)
+                        st.download_button(
+                            label="Download CSV",
+                            data=csv,
+                            file_name=f"{template_details['TEMPLATE_NAME']}.csv",
+                            mime="text/csv"
+                        )
+                    except Exception as e:
+                        st.error(f"Error executing query: {e}")
+    else:
+        st.warning("No templates found. Please create a template first.")
+
+if __name__ == "__main__":
+    main()
