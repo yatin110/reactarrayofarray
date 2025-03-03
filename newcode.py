@@ -46,7 +46,9 @@ def get_columns(table_name: str) -> List[str]:
     
     cursor = conn.cursor()
     try:
-        cursor.execute(f"SELECT column_name, data_type FROM user_tab_columns WHERE table_name = '{table_name}' ORDER BY column_id")
+        # Use bind variables to prevent SQL injection
+        cursor.execute("SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :table_name ORDER BY column_id",
+                     {"table_name": table_name})
         columns = [(row[0], row[1]) for row in cursor.fetchall()]
         return columns
     except Exception as e:
@@ -254,14 +256,16 @@ def create_parent_template():
                 "right_column": right_column
             }
             st.session_state.joins.append(join)
+            st.success("Join added successfully")
     
     # Display current joins
     if st.session_state.joins:
         st.subheader("Current Joins")
         for i, join in enumerate(st.session_state.joins):
             st.write(f"{join['left_table']}.{join['left_column']} = {join['right_table']}.{join['right_column']}")
-            if st.button(f"Remove Join {i+1}"):
+            if st.button(f"Remove Join {i+1}", key=f"remove_join_{i}"):
                 st.session_state.joins.pop(i)
+                st.success("Join removed")
                 st.experimental_rerun()
     
     # Column selection
@@ -277,6 +281,15 @@ def create_parent_template():
         cols = get_columns(table)
         for col in cols:
             all_columns.append({"table": table, "column": col[0], "data_type": col[1]})
+    
+    # Create a dictionary to keep track of all available columns for WHERE conditions
+    all_columns_for_where = {}
+    for table in selected_tables:
+        cols = get_columns(table)
+        if table not in all_columns_for_where:
+            all_columns_for_where[table] = []
+        for col in cols:
+            all_columns_for_where[table].append(col[0])
     
     # Display column selection interface
     for idx, col_info in enumerate(all_columns):
@@ -314,13 +327,18 @@ def create_parent_template():
     if "where_conditions" not in st.session_state:
         st.session_state.where_conditions = []
     
+    # Create a flat list of all table.column combinations for the where clause
+    all_table_columns = []
+    for table in all_columns_for_where:
+        for column in all_columns_for_where[table]:
+            all_table_columns.append(f"{table}.{column}")
+    
     col1, col2, col3 = st.columns([3, 2, 3])
     with col1:
-        if st.session_state.selected_columns:
-            column_options = [f"{c['table']}.{c['column']}" for c in st.session_state.selected_columns]
-            where_column = st.selectbox("Column", column_options, key="where_column")
+        if all_table_columns:
+            where_column = st.selectbox("Column", all_table_columns, key="where_column")
         else:
-            where_column = st.selectbox("Column", ["No columns selected"], disabled=True)
+            where_column = st.selectbox("Column", ["No columns available"], disabled=True)
     with col2:
         operators = ["=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"]
         where_operator = st.selectbox("Operator", operators, key="where_operator")
@@ -336,18 +354,20 @@ def create_parent_template():
         else:
             condition = f"{where_column} {where_operator} {where_value}"
         st.session_state.where_conditions.append(condition)
+        st.success("Condition added successfully")
     
     # Display current where conditions
     if st.session_state.where_conditions:
         st.subheader("Current Where Conditions")
         for i, condition in enumerate(st.session_state.where_conditions):
             st.write(condition)
-            if st.button(f"Remove Condition {i+1}"):
+            if st.button(f"Remove Condition {i+1}", key=f"remove_condition_{i}"):
                 st.session_state.where_conditions.pop(i)
+                st.success("Condition removed")
                 st.experimental_rerun()
     
     # Generate query button
-    if st.button("Generate Query"):
+    if st.button("Generate Parent Query"):
         if not template_name:
             st.error("Please provide a template name")
         elif not selected_tables:
@@ -389,7 +409,7 @@ def create_parent_template():
             st.code(query, language="sql")
             
             # Save template button
-            if st.button("Save Template"):
+            if st.button("Save Parent Template"):
                 success = save_template(
                     template_name=template_name,
                     template_type="PARENT",
@@ -407,6 +427,7 @@ def create_parent_template():
                     st.session_state.current_template_name = ""
                     st.session_state.current_template_type = ""
                     st.session_state.current_template_data = ""
+                    st.experimental_rerun()
 
 def create_child_template():
     st.subheader("Create Child Template")
@@ -416,6 +437,10 @@ def create_child_template():
     # Parent template selection
     parent_templates = get_parent_templates()
     parent_template_names = [t["name"] for t in parent_templates]
+    
+    if not parent_template_names:
+        st.warning("No parent templates available. Please create a parent template first.")
+        return
     
     selected_parent = st.selectbox("Select Parent Template", parent_template_names)
     
@@ -464,20 +489,22 @@ def create_child_template():
                     else:
                         where_value = st.text_input("Value", key="child_where_value")
                 
-                if st.button("Add Condition"):
+                if st.button("Add Child Condition"):
                     if where_operator in ["IS NULL", "IS NOT NULL"]:
                         condition = f"{where_column} {where_operator}"
                     else:
                         condition = f"{where_column} {where_operator} {where_value}"
                     st.session_state.child_where_conditions.append(condition)
+                    st.success("Condition added successfully")
                 
                 # Display current where conditions
                 if st.session_state.child_where_conditions:
                     st.subheader("Current Where Conditions")
                     for i, condition in enumerate(st.session_state.child_where_conditions):
                         st.write(condition)
-                        if st.button(f"Remove Child Condition {i+1}"):
+                        if st.button(f"Remove Child Condition {i+1}", key=f"remove_child_condition_{i}"):
                             st.session_state.child_where_conditions.pop(i)
+                            st.success("Condition removed")
                             st.experimental_rerun()
                 
                 # Generate query button
@@ -530,6 +557,7 @@ def create_child_template():
                                 st.session_state.current_template_name = ""
                                 st.session_state.current_template_type = ""
                                 st.session_state.current_template_data = ""
+                                st.experimental_rerun()
             
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -542,6 +570,10 @@ def edit_template():
     
     # Get all templates
     templates = get_all_templates()
+    if not templates:
+        st.warning("No templates available to edit.")
+        return
+        
     template_options = [f"{t['name']} ({t['type']})" for t in templates]
     
     selected_template_option = st.selectbox("Select Template to Edit", template_options)
@@ -587,56 +619,97 @@ def view_templates():
     # Get all templates
     templates = get_all_templates()
     
+    if not templates:
+        st.warning("No templates available to view.")
+        return
+    
     # Create a table of templates
     template_df = pd.DataFrame([
         {"ID": t["id"], "Name": t["name"], "Type": t["type"]} 
         for t in templates
     ])
     
-    if not template_df.empty:
-        st.dataframe(template_df)
+    st.dataframe(template_df)
+    
+    # Select a template to view
+    template_id = st.number_input("Enter Template ID to View", min_value=1, step=1)
+    
+    if st.button("View Template"):
+        template = get_template_by_id(template_id)
         
-        # Select a template to view
-        template_id = st.number_input("Enter Template ID to View", min_value=1, step=1)
-        
-        if st.button("View Template"):
-            template = get_template_by_id(template_id)
+        if template:
+            st.subheader(f"Template: {template['name']} ({template['type']})")
+            st.code(template["query"], language="sql")
             
-            if template:
-                st.subheader(f"Template: {template['name']} ({template['type']})")
-                st.code(template["query"], language="sql")
-                
-                # Execute query button
-                if st.button("Execute Query"):
-                    conn = get_db_connection()
-                    if conn:
-                        try:
-                            cursor = conn.cursor()
-                            cursor.execute(template["query"])
-                            
-                            # Fetch a limited number of rows
-                            rows = cursor.fetchmany(100)
-                            
-                            if rows:
-                                # Convert to DataFrame for display
-                                columns = [col[0] for col in cursor.description]
-                                result_df = pd.DataFrame(rows, columns=columns)
-                                
-                                st.subheader("Query Results (First 100 rows)")
-                                st.dataframe(result_df)
-                            else:
-                                st.info("Query returned no results")
+            # Execute query button
+            if st.button("Execute Query"):
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute(template["query"])
                         
-                        except Exception as e:
-                            st.error(f"Error executing query: {str(e)}")
-                        finally:
-                            cursor.close()
-                            conn.close()
-    else:
-        st.info("No templates found")
+                        # Fetch a limited number of rows
+                        rows = cursor.fetchmany(100)
+                        
+                        if rows:
+                            # Convert to DataFrame for display
+                            columns = [col[0] for col in cursor.description]
+                            result_df = pd.DataFrame(rows, columns=columns)
+                            
+                            st.subheader("Query Results (First 100 rows)")
+                            st.dataframe(result_df)
+                        else:
+                            st.info("Query returned no results")
+                    
+                    except Exception as e:
+                        st.error(f"Error executing query: {str(e)}")
+                    finally:
+                        cursor.close()
+                        conn.close()
+        else:
+            st.error(f"Template with ID {template_id} not found")
+
+def init_database():
+    """Create the necessary tables if they don't exist"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
+    cursor = conn.cursor()
+    try:
+        # Check if the table exists
+        cursor.execute("""
+            SELECT COUNT(*) FROM user_tables WHERE table_name = 'SQL_TEMPLATES'
+        """)
+        if cursor.fetchone()[0] == 0:
+            # Create the table
+            cursor.execute("""
+                CREATE TABLE sql_templates (
+                    template_id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    template_name VARCHAR2(255) NOT NULL,
+                    template_type VARCHAR2(20) NOT NULL,
+                    query CLOB NOT NULL,
+                    template_data CLOB,
+                    parent_id NUMBER,
+                    CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES sql_templates(template_id)
+                )
+            """)
+            conn.commit()
+            return True
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error initializing database: {str(e)}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
 
 def main():
     st.title("SQL Template Manager")
+    
+    # Initialize database
+    init_database()
     
     # Create sidebar for navigation
     st.sidebar.title("Navigation")
