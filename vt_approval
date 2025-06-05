@@ -163,7 +163,7 @@ class DatabaseManager:
                 return True
         except Exception as e:
             st.error(f"Query execution error: {str(e)}")
-            return False
+            return pd.DataFrame() if fetch else False
     
     def create_tables(self):
         """Create necessary database tables"""
@@ -225,139 +225,178 @@ def authenticate_user(username: str, password: str) -> bool:
     """Authenticate user credentials"""
     db = DatabaseManager()
     if db.connect():
-        query = "SELECT user_id, role FROM users WHERE username = :1 AND password_hash = :2"
-        result = db.execute_query(query, (username, hash_password(password)))
-        db.disconnect()
-        
-        if not result.empty:
-            st.session_state.logged_in = True
-            st.session_state.username = username
-            st.session_state.user_role = result.iloc[0]['ROLE']
-            st.session_state.user_id = result.iloc[0]['USER_ID']
-            return True
+        try:
+            query = "SELECT user_id, role FROM users WHERE username = :1 AND password_hash = :2"
+            result = db.execute_query(query, (username, hash_password(password)))
+            db.disconnect()
+            
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.session_state.user_role = result.iloc[0]['ROLE']
+                st.session_state.user_id = result.iloc[0]['USER_ID']
+                return True
+        except Exception as e:
+            st.error(f"Authentication error: {str(e)}")
+            db.disconnect()
     return False
 
 def get_denodo_views() -> pd.DataFrame:
     """Fetch all Denodo views from database"""
     db = DatabaseManager()
     if db.connect():
-        query = "SELECT view_id, view_name, folder_path, description FROM denodo_views WHERE is_active = 1 ORDER BY view_name"
-        result = db.execute_query(query)
-        db.disconnect()
-        return result
+        try:
+            query = "SELECT view_id, view_name, folder_path, description FROM denodo_views WHERE is_active = 1 ORDER BY view_name"
+            result = db.execute_query(query)
+            db.disconnect()
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching views: {str(e)}")
+            db.disconnect()
     return pd.DataFrame()
 
 def submit_request(view_id: int, request_type: str, description: str) -> bool:
     """Submit a new view request"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        INSERT INTO view_requests (view_id, requester_id, request_type, description)
-        VALUES (:1, :2, :3, :4)
-        """
-        success = db.execute_query(query, (view_id, st.session_state.user_id, request_type, description), fetch=False)
-        db.disconnect()
-        return success
+        try:
+            query = """
+            INSERT INTO view_requests (view_id, requester_id, request_type, description)
+            VALUES (:1, :2, :3, :4)
+            """
+            success = db.execute_query(query, (view_id, st.session_state.user_id, request_type, description), fetch=False)
+            db.disconnect()
+            return success == True
+        except Exception as e:
+            st.error(f"Error submitting request: {str(e)}")
+            db.disconnect()
     return False
 
 def get_user_requests() -> pd.DataFrame:
     """Get all requests made by current user"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        SELECT vr.request_id, dv.view_name, vr.request_type, vr.description, 
-               vr.status, vr.created_date, vr.comments
-        FROM view_requests vr
-        JOIN denodo_views dv ON vr.view_id = dv.view_id
-        WHERE vr.requester_id = :1
-        ORDER BY vr.created_date DESC
-        """
-        result = db.execute_query(query, (st.session_state.user_id,))
-        db.disconnect()
-        return result
+        try:
+            query = """
+            SELECT vr.request_id, dv.view_name, vr.request_type, vr.description, 
+                   vr.status, vr.created_date, vr.comments
+            FROM view_requests vr
+            JOIN denodo_views dv ON vr.view_id = dv.view_id
+            WHERE vr.requester_id = :1
+            ORDER BY vr.created_date DESC
+            """
+            result = db.execute_query(query, (st.session_state.user_id,))
+            db.disconnect()
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching user requests: {str(e)}")
+            db.disconnect()
     return pd.DataFrame()
 
 def get_view_changelog() -> pd.DataFrame:
     """Get change log for all views"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        SELECT dv.view_name, vr.request_type, vr.status, 
-               u.username as requester, vr.created_date,
-               CASE WHEN vr.approved_by IS NOT NULL THEN u2.username ELSE NULL END as approved_by,
-               vr.approved_date
-        FROM view_requests vr
-        JOIN denodo_views dv ON vr.view_id = dv.view_id
-        JOIN users u ON vr.requester_id = u.user_id
-        LEFT JOIN users u2 ON vr.approved_by = u2.user_id
-        ORDER BY dv.view_name, vr.created_date DESC
-        """
-        result = db.execute_query(query)
-        db.disconnect()
-        return result
+        try:
+            query = """
+            SELECT dv.view_name, vr.request_type, vr.status, 
+                   u.username as requester, vr.created_date,
+                   CASE WHEN vr.approved_by IS NOT NULL THEN u2.username ELSE NULL END as approved_by,
+                   vr.approved_date
+            FROM view_requests vr
+            JOIN denodo_views dv ON vr.view_id = dv.view_id
+            JOIN users u ON vr.requester_id = u.user_id
+            LEFT JOIN users u2 ON vr.approved_by = u2.user_id
+            ORDER BY dv.view_name, vr.created_date DESC
+            """
+            result = db.execute_query(query)
+            db.disconnect()
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching changelog: {str(e)}")
+            db.disconnect()
     return pd.DataFrame()
 
 def get_requests_for_view(view_name: str) -> pd.DataFrame:
     """Get all requests for a specific view"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        SELECT vr.request_id, vr.request_type, vr.description, vr.status,
-               u.username as requester, vr.created_date,
-               CASE WHEN vr.approved_by IS NOT NULL THEN u2.username ELSE NULL END as approved_by,
-               vr.approved_date, vr.comments
-        FROM view_requests vr
-        JOIN denodo_views dv ON vr.view_id = dv.view_id
-        JOIN users u ON vr.requester_id = u.user_id
-        LEFT JOIN users u2 ON vr.approved_by = u2.user_id
-        WHERE dv.view_name = :1
-        ORDER BY vr.created_date DESC
-        """
-        result = db.execute_query(query, (view_name,))
-        db.disconnect()
-        return result
+        try:
+            query = """
+            SELECT vr.request_id, vr.request_type, vr.description, vr.status,
+                   u.username as requester, vr.created_date,
+                   CASE WHEN vr.approved_by IS NOT NULL THEN u2.username ELSE NULL END as approved_by,
+                   vr.approved_date, vr.comments
+            FROM view_requests vr
+            JOIN denodo_views dv ON vr.view_id = dv.view_id
+            JOIN users u ON vr.requester_id = u.user_id
+            LEFT JOIN users u2 ON vr.approved_by = u2.user_id
+            WHERE dv.view_name = :1
+            ORDER BY vr.created_date DESC
+            """
+            result = db.execute_query(query, (view_name,))
+            db.disconnect()
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching requests for view: {str(e)}")
+            db.disconnect()
     return pd.DataFrame()
 
 def get_pending_requests() -> pd.DataFrame:
     """Get all pending requests for approvers"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        SELECT vr.request_id, dv.view_name, vr.request_type, vr.description,
-               u.username as requester, vr.created_date
-        FROM view_requests vr
-        JOIN denodo_views dv ON vr.view_id = dv.view_id
-        JOIN users u ON vr.requester_id = u.user_id
-        WHERE vr.status = 'PENDING'
-        ORDER BY vr.created_date ASC
-        """
-        result = db.execute_query(query)
-        db.disconnect()
-        return result
+        try:
+            query = """
+            SELECT vr.request_id, dv.view_name, vr.request_type, vr.description,
+                   u.username as requester, vr.created_date
+            FROM view_requests vr
+            JOIN denodo_views dv ON vr.view_id = dv.view_id
+            JOIN users u ON vr.requester_id = u.user_id
+            WHERE vr.status = 'PENDING'
+            ORDER BY vr.created_date ASC
+            """
+            result = db.execute_query(query)
+            db.disconnect()
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching pending requests: {str(e)}")
+            db.disconnect()
     return pd.DataFrame()
 
 def approve_reject_request(request_id: int, action: str, comments: str = "") -> bool:
     """Approve or reject a request"""
     db = DatabaseManager()
     if db.connect():
-        query = """
-        UPDATE view_requests 
-        SET status = :1, approved_by = :2, approved_date = SYSDATE, comments = :3
-        WHERE request_id = :4
-        """
-        success = db.execute_query(query, (action, st.session_state.user_id, comments, request_id), fetch=False)
-        db.disconnect()
-        return success
+        try:
+            query = """
+            UPDATE view_requests 
+            SET status = :1, approved_by = :2, approved_date = SYSDATE, comments = :3
+            WHERE request_id = :4
+            """
+            success = db.execute_query(query, (action, st.session_state.user_id, comments, request_id), fetch=False)
+            db.disconnect()
+            return success == True
+        except Exception as e:
+            st.error(f"Error updating request: {str(e)}")
+            db.disconnect()
     return False
 
 def is_approver() -> bool:
     """Check if current user is an approver"""
+    if 'user_id' not in st.session_state:
+        return False
+        
     db = DatabaseManager()
     if db.connect():
-        query = "SELECT 1 FROM approvers WHERE user_id = :1 AND is_active = 1"
-        result = db.execute_query(query, (st.session_state.user_id,))
-        db.disconnect()
-        return not result.empty
+        try:
+            query = "SELECT 1 FROM approvers WHERE user_id = :1 AND is_active = 1"
+            result = db.execute_query(query, (st.session_state.user_id,))
+            db.disconnect()
+            return isinstance(result, pd.DataFrame) and not result.empty
+        except Exception as e:
+            st.error(f"Error checking approver status: {str(e)}")
+            db.disconnect()
     return False
 
 def login_page():
