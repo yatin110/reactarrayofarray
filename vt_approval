@@ -109,6 +109,7 @@ from datetime import datetime
 import os
 from typing import List, Dict, Optional
 import hashlib
+import numpy as np
 
 # Database Configuration
 DB_CONFIG = {
@@ -147,6 +148,21 @@ class DatabaseManager:
         """Execute SQL query"""
         try:
             cursor = self.connection.cursor()
+            
+            # Convert numpy types to native Python types
+            if params:
+                converted_params = []
+                for param in params:
+                    if isinstance(param, (np.integer, np.int64, np.int32)):
+                        converted_params.append(int(param))
+                    elif isinstance(param, (np.floating, np.float64, np.float32)):
+                        converted_params.append(float(param))
+                    elif isinstance(param, np.str_):
+                        converted_params.append(str(param))
+                    else:
+                        converted_params.append(param)
+                params = tuple(converted_params)
+            
             if params:
                 cursor.execute(query, params)
             else:
@@ -227,14 +243,14 @@ def authenticate_user(username: str, password: str) -> bool:
     if db.connect():
         try:
             query = "SELECT user_id, role FROM users WHERE username = :1 AND password_hash = :2"
-            result = db.execute_query(query, (username, hash_password(password)))
+            result = db.execute_query(query, (str(username), hash_password(str(password))))
             db.disconnect()
             
             if isinstance(result, pd.DataFrame) and not result.empty:
                 st.session_state.logged_in = True
                 st.session_state.username = username
-                st.session_state.user_role = result.iloc[0]['ROLE']
-                st.session_state.user_id = result.iloc[0]['USER_ID']
+                st.session_state.user_role = str(result.iloc[0]['ROLE'])
+                st.session_state.user_id = int(result.iloc[0]['USER_ID'])
                 return True
         except Exception as e:
             st.error(f"Authentication error: {str(e)}")
@@ -264,7 +280,7 @@ def submit_request(view_id: int, request_type: str, description: str) -> bool:
             INSERT INTO view_requests (view_id, requester_id, request_type, description)
             VALUES (:1, :2, :3, :4)
             """
-            success = db.execute_query(query, (view_id, st.session_state.user_id, request_type, description), fetch=False)
+            success = db.execute_query(query, (int(view_id), int(st.session_state.user_id), str(request_type), str(description)), fetch=False)
             db.disconnect()
             return success == True
         except Exception as e:
@@ -285,7 +301,7 @@ def get_user_requests() -> pd.DataFrame:
             WHERE vr.requester_id = :1
             ORDER BY vr.created_date DESC
             """
-            result = db.execute_query(query, (st.session_state.user_id,))
+            result = db.execute_query(query, (int(st.session_state.user_id),))
             db.disconnect()
             return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
         except Exception as e:
@@ -334,7 +350,7 @@ def get_requests_for_view(view_name: str) -> pd.DataFrame:
             WHERE dv.view_name = :1
             ORDER BY vr.created_date DESC
             """
-            result = db.execute_query(query, (view_name,))
+            result = db.execute_query(query, (str(view_name),))
             db.disconnect()
             return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
         except Exception as e:
@@ -374,7 +390,7 @@ def approve_reject_request(request_id: int, action: str, comments: str = "") -> 
             SET status = :1, approved_by = :2, approved_date = SYSDATE, comments = :3
             WHERE request_id = :4
             """
-            success = db.execute_query(query, (action, st.session_state.user_id, comments, request_id), fetch=False)
+            success = db.execute_query(query, (str(action), int(st.session_state.user_id), str(comments), int(request_id)), fetch=False)
             db.disconnect()
             return success == True
         except Exception as e:
@@ -391,7 +407,7 @@ def is_approver() -> bool:
     if db.connect():
         try:
             query = "SELECT 1 FROM approvers WHERE user_id = :1 AND is_active = 1"
-            result = db.execute_query(query, (st.session_state.user_id,))
+            result = db.execute_query(query, (int(st.session_state.user_id),))
             db.disconnect()
             return isinstance(result, pd.DataFrame) and not result.empty
         except Exception as e:
@@ -560,18 +576,18 @@ def approver_dashboard():
             # Approval actions
             col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
-                comments = st.text_input(f"Comments for Request {request['REQUEST_ID']}", 
-                                       key=f"comments_{request['REQUEST_ID']}")
+                comments = st.text_input(f"Comments for Request {int(request['REQUEST_ID'])}", 
+                                       key=f"comments_{int(request['REQUEST_ID'])}")
             with col2:
-                if st.button("✅ Approve", key=f"approve_{request['REQUEST_ID']}"):
-                    if approve_reject_request(request['REQUEST_ID'], 'APPROVED', comments):
+                if st.button("✅ Approve", key=f"approve_{int(request['REQUEST_ID'])}"):
+                    if approve_reject_request(int(request['REQUEST_ID']), 'APPROVED', comments):
                         st.success("Request approved!")
                         st.rerun()
                     else:
                         st.error("Failed to approve request")
             with col3:
-                if st.button("❌ Reject", key=f"reject_{request['REQUEST_ID']}"):
-                    if approve_reject_request(request['REQUEST_ID'], 'REJECTED', comments):
+                if st.button("❌ Reject", key=f"reject_{int(request['REQUEST_ID'])}"):
+                    if approve_reject_request(int(request['REQUEST_ID']), 'REJECTED', comments):
                         st.success("Request rejected!")
                         st.rerun()
                     else:
