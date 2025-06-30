@@ -1,0 +1,62 @@
+import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+import tempfile
+import os
+
+# Sample DataFrame
+df = pd.DataFrame({
+    'Category': ['A', 'B', 'C'],
+    'Value': [10, 30, 20]
+})
+
+# Display DataFrame
+st.write("### Your Data")
+st.dataframe(df)
+
+# Plot
+fig, ax = plt.subplots()
+df.plot(kind='bar', x='Category', y='Value', ax=ax)
+st.pyplot(fig)
+
+# Summary
+summary = f"Summary:\nThe category with highest value is {df.loc[df['Value'].idxmax(), 'Category']}."
+
+st.write("### Summary")
+st.write(summary)
+
+# --- PDF Generation Function ---
+def generate_pdf(summary_text, df, plot_fig):
+    pdf = FPDF()
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Arial", size=16)
+    pdf.cell(200, 10, txt="Analysis Report", ln=True, align='C')
+
+    # Summary
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, summary_text)
+
+    # Save plot to image file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmpfile:
+        plot_fig.savefig(tmpfile.name)
+        image_path = tmpfile.name
+
+    pdf.image(image_path, x=10, y=None, w=180)
+
+    # Table (as text)
+    table_text = df.to_string(index=False)
+    pdf.multi_cell(0, 10, f"\nTable:\n{table_text}")
+
+    # Save PDF
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+        pdf.output(tmp_pdf.name)
+        return tmp_pdf.name
+
+# --- Print Button ---
+if st.button("Generate PDF Report"):
+    pdf_path = generate_pdf(summary, df, fig)
+    with open(pdf_path, "rb") as f:
+        st.download_button("Download Report PDF", f, file_name="report.pdf")
